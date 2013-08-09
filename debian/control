@@ -1,0 +1,24 @@
+Source: mesos
+Section: misc
+Priority: extra
+Maintainer: Damien Hardy <dhardy@viadeoteam.com>
+Build-Depends: debhelper (>= 8.0.0)
+Standards-Version: 3.9.3
+Homepage: https://mesos.apache.org
+Vcs-Git: https://github.com/apache/mesos.git
+
+Package: mesos-common
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: common files and library of mesos nodes
+ Provide common files and library needed to run master or slave node
+
+Package: mesos-master
+Architecture: all
+Description: master service of mesos
+ Provide master service script for mesos node.
+
+Package: mesos-slave
+Architecture: all
+Description: slave service of mesos
+ Provide slave service script for mesos node.
