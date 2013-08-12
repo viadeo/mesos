@@ -1,0 +1,6 @@
+var/mesos/deploy var/mesos/
+usr/bin/ usr/bin
+usr/lib/mesos* usr/bin
+usr/sbin/mesos-* usr/sbin
+usr/include/mesos usr/include
+usr/lib/libmesos.so usr/lib
