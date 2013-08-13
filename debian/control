@@ -2,7 +2,7 @@ Source: mesos
 Section: misc
 Priority: extra
 Maintainer: Damien Hardy <dhardy@viadeoteam.com>
-Build-Depends: debhelper (>= 8.0.0), libunwind7|libunwind8, java7-jdk|java6-sdk, python-dev, libcurl3-dev
+Build-Depends: debhelper (>= 8.0.0), libunwind7|libunwind8, java7-jdk|java6-sdk, python-dev, libcurl3-dev, autoconf
 Standards-Version: 3.9.3
 Homepage: https://mesos.apache.org
 Vcs-Git: https://github.com/apache/mesos.git
