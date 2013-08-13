@@ -2,7 +2,8 @@ Source: mesos
 Section: misc
 Priority: extra
 Maintainer: Damien Hardy <dhardy@viadeoteam.com>
-Build-Depends: debhelper (>= 8.0.0), libunwind7|libunwind8, java7-jdk|java6-sdk, python-dev, libcurl3-dev, autoconf, libtool
+Build-Depends: debhelper (>= 8.0.0), libunwind7|libunwind8, java7-jdk|java6-sdk, python-all-dev (>= 2.6), libcurl3-dev, autoconf, libtool, dh-autoreconf, python-setuptools, python-protobuf
+X-Python-Version: >= 2.6
 Standards-Version: 3.9.3
 Homepage: https://mesos.apache.org
 Vcs-Git: https://github.com/apache/mesos.git
@@ -15,10 +16,21 @@ Description: common files and library of mesos nodes
 
 Package: mesos-master
 Architecture: all
+Depends: mesos-common (= ${binary:Version})
 Description: master service of mesos
  Provide master service script for mesos node.
 
 Package: mesos-slave
 Architecture: all
+Depends: mesos-common (= ${binary:Version})
 Description: slave service of mesos
  Provide slave service script for mesos node.
+
+Package: python-mesos
+Architecture: any
+Section: python
+XB-Python-Version: ${python:Versions}
+Depends: mesos-common (= ${binary:Version}), ${python:Depends}
+Description: Python bindings for Mesos
+ Provide python binding for Mesos framework
+

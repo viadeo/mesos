@@ -16,16 +16,30 @@
 # This has to be exported to make some magic below work.
 export DH_OPTIONS
 
+PYVERS := $(shell pyversions -vr)
+
+export GTEST_FILTER = "*:-OsTest.pstree:-ExamplesTest.*"
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed,-lsnappy
+
 override_dh_auto_configure:
-	autoreconf -f -i -Wall,no-obsolete
-	./bootstrap
-	dh_auto_configure
+	dh_auto_configure -- --prefix=/usr
 
 override_dh_auto_install:
+	# Install Python bindings
+	cd src/python && \
+		for pv in $(PYVERS); do \
+			python$$pv setup.py build --build-base=$(CURDIR)/src/python/build \
+								 install --root=$(CURDIR)/debian/tmp --install-layout=deb ;\
+		done
 	dh_auto_install
 
-override_dh_shlibdeps:
-	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info
+override_dh_auto_build:
+	dh_auto_build
+	# Build Python bindings
+	cd src/python && \
+		for pv in $(PYVERS); do \
+			python$$pv setup.py build --build-base=$(CURDIR)/src/python/build ;\
+		done
 
 %:
-	dh $@ 
+	dh $@ --parallel --with autoreconf --with python2
