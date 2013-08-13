@@ -33,6 +33,10 @@ override_dh_auto_install:
 		done
 	dh_auto_install
 
+override_dh_install:
+	dh_install
+	chrpath -d debian/mesos-common/usr/lib/libmesos-*.so
+
 override_dh_auto_build:
 	dh_auto_build
 	# Build Python bindings

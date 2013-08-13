@@ -2,7 +2,7 @@ Source: mesos
 Section: misc
 Priority: extra
 Maintainer: Damien Hardy <dhardy@viadeoteam.com>
-Build-Depends: debhelper (>= 8.0.0), libunwind7|libunwind8, java7-jdk|java6-sdk, python-all-dev (>= 2.6), libcurl3-dev, autoconf, libtool, dh-autoreconf, python-setuptools, python-protobuf
+Build-Depends: debhelper (>= 8.0.0), libunwind7|libunwind8, java7-jdk|java6-sdk, python-all-dev (>= 2.6), libcurl3-dev, autoconf, libtool, dh-autoreconf, python-setuptools, python-protobuf, chrpath
 X-Python-Version: >= 2.6
 Standards-Version: 3.9.3
 Homepage: https://mesos.apache.org
@@ -15,13 +15,13 @@ Description: common files and library of mesos nodes
  Provide common files and library needed to run master or slave node
 
 Package: mesos-master
-Architecture: all
+Architecture: any
 Depends: mesos-common (= ${binary:Version})
 Description: master service of mesos
  Provide master service script for mesos node.
 
 Package: mesos-slave
-Architecture: all
+Architecture: any
 Depends: mesos-common (= ${binary:Version})
 Description: slave service of mesos
  Provide slave service script for mesos node.
