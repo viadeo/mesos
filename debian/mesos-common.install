@@ -1,4 +1,3 @@
-var/mesos/deploy var/mesos/
 usr/bin usr/bin
 usr/lib/mesos usr/lib
 usr/lib/libmesos* usr/lib

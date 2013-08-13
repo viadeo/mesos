@@ -1,1 +1,4 @@
+var/mesos/deploy var/mesos/
 usr/share/mesos usr/share
+usr/sbin/mesos-master usr/sbin
+usr/sbin/*.sh

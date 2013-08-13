@@ -23,6 +23,10 @@ go_daemon() {
   [ -z "${ULIMIT:-}" ] || ulimit $ULIMIT
   exec /usr/sbin/mesos-slave \
     ${MASTER:+--master=$MASTER} \
+    ${IP:+--ip=$IP} \
+    ${PORT:+--port=$PORT} \
+    ${WORKDIR:+--work_dir=$WORKDIR} \
+    $OPTS \
     >> "$LOGS"/slave.log 2>&1
 }
 
