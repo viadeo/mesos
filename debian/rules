@@ -18,7 +18,7 @@ export DH_OPTIONS
 
 PYVERS := $(shell pyversions -vr)
 
-export GTEST_FILTER = "*:-OsTest.pstree:-ExamplesTest.*"
+export GTEST_FILTER = "-OsTest.pstree"
 export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed,-lsnappy
 
 override_dh_auto_configure:
