@@ -16,13 +16,13 @@ Description: common files and library of mesos nodes
 
 Package: mesos-master
 Architecture: any
-Depends: mesos-common (= ${binary:Version})
+Depends: ${shlibs:Depends}, ${misc:Depends}, mesos-common (= ${binary:Version})
 Description: master service of mesos
  Provide master service script for mesos node.
 
 Package: mesos-slave
 Architecture: any
-Depends: mesos-common (= ${binary:Version})
+Depends: ${shlibs:Depends}, ${misc:Depends}, mesos-common (= ${binary:Version})
 Description: slave service of mesos
  Provide slave service script for mesos node.
 
@@ -30,7 +30,7 @@ Package: python-mesos
 Architecture: any
 Section: python
 XB-Python-Version: ${python:Versions}
-Depends: mesos-common (= ${binary:Version}), ${python:Depends}
+Depends: mesos-common (= ${binary:Version}), ${python:Depends}, ${misc:Depends}, ${shlibs:Depends}
 Description: Python bindings for Mesos
  Provide python binding for Mesos framework
 

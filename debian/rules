@@ -18,11 +18,11 @@ export DH_OPTIONS
 
 PYVERS := $(shell pyversions -vr)
 
-export GTEST_FILTER = "-OsTest.pstree"
-export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed,-lsnappy
+export GTEST_FILTER=-OsTest.*tree
+export DEB_LDFLAGS_MAINT_APPEND=-Wl,--as-needed,-lsnappy
 
 override_dh_auto_configure:
-	dh_auto_configure -- --prefix=/usr
+	dh_auto_configure -- --prefix=/usr --localstatedir=/usr/lib/ --libexecdir=/usr/lib/
 
 override_dh_auto_install:
 	# Install Python bindings
