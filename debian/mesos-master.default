@@ -6,7 +6,7 @@ ULIMIT="-n 8192"
 #PORT=5050
 #SLAVES=*
 #WHITELIST=*
-#OPTS="--hadoop_home=/usr/lib/hadoop-0.20/"
+#OPTS=""
 
 # alternative is to use MESOS_<option> as an envar
 # option list is available with /usr/sbin/mesos-master --help

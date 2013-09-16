@@ -26,7 +26,7 @@ go_daemon() {
     ${IP:+--ip=$IP} \
     ${PORT:+--port=$PORT} \
     ${WORKDIR:+--work_dir=$WORKDIR} \
-    $OPTS \
+    ${OPTS:+$OPTS} \
     >> "$LOGS"/slave.log 2>&1
 }
 

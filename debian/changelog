@@ -1,3 +1,9 @@
+mesos (0.15-1) unstable; urgency=low
+
+  * release 0.15
+
+ -- Damien Hardy <dhardy@viadeoteam.com>  Mon, 16 Sep 2013 18:08:55 +0200
+
 mesos (0.14-1) unstable; urgency=low
 
   * Initial release
