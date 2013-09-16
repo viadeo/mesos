@@ -128,7 +128,7 @@ public:
     // Setup recovery slave flags.
     flags.checkpoint = true;
     flags.recover = "reconnect";
-    flags.strict = false;
+    flags.strict = true;
 
     return flags;
   }
@@ -690,6 +690,99 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedExecutor)
 }
 
 
+// The slave is stopped after a non-terminal update is received.
+// The command executor is expected to self-terminate while the slave
+// is down, because the recovery timeout elapses.
+// When the slave comes back up with recovery=reconnect, make
+// sure the task is properly transitioned to FAILED.
+TYPED_TEST(SlaveRecoveryTest, RecoveryTimeout)
+{
+  Try<PID<Master> > master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  TypeParam isolator1;
+
+  // Set a short recovery timeout, as we can't control the executor
+  // driver time when using the process / cgroups isolators.
+  slave::Flags flags = this->CreateSlaveFlags();
+  flags.recovery_timeout = Milliseconds(1);
+
+  Try<PID<Slave> > slave = this->StartSlave(&isolator1, flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  frameworkInfo.set_checkpoint(true);
+
+  MesosSchedulerDriver driver(&sched, frameworkInfo, master.get());
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());      // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  vector<TaskInfo> tasks;
+  tasks.push_back(task); // Long-running task.
+
+  EXPECT_CALL(sched, statusUpdate(_, _));
+
+  Future<Nothing> _statusUpdateAcknowledgement =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement);
+
+  this->Stop(slave.get());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  // Ensure the executor terminates by causing the recovery timeout
+  // to elapse while disconnected from the slave.
+  os::sleep(Milliseconds(1));
+
+  Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
+
+  // Restart the slave (use same flags) with a new isolator.
+  TypeParam isolator2;
+
+  slave = this->StartSlave(&isolator2, flags);
+  ASSERT_SOME(slave);
+
+  Clock::pause();
+
+  AWAIT_READY(_recover);
+
+  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::settle();
+
+  Clock::resume();
+
+  // Scheduler should receive the TASK_FAILED update.
+  AWAIT_READY(status);
+  ASSERT_EQ(TASK_FAILED, status.get().state());
+
+  driver.stop();
+  driver.join();
+
+  this->Shutdown(); // Shutdown before isolator(s) get deallocated.
+}
+
+
 // The slave is stopped after an executor is completed (i.e., it has
 // terminated and all its updates have been acknowledged).
 // When it comes back up with recovery=reconnect, make
@@ -733,6 +826,9 @@ TYPED_TEST(SlaveRecoveryTest, RecoverCompletedExecutor)
 
   EXPECT_CALL(sched, statusUpdate(_, _))
     .Times(2); // TASK_RUNNING and TASK_FINISHED updates.
+
+  EXPECT_CALL(sched, offerRescinded(_, _))
+    .Times(AtMost(1));
 
   Future<Nothing> schedule = FUTURE_DISPATCH(
       _, &GarbageCollectorProcess::schedule);
@@ -791,8 +887,7 @@ TYPED_TEST(SlaveRecoveryTest, CleanupExecutor)
 
   Future<vector<Offer> > offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillOnce(FutureArg<1>(&offers));
 
   driver.start();
 
@@ -815,9 +910,16 @@ TYPED_TEST(SlaveRecoveryTest, CleanupExecutor)
 
   this->Stop(slave.get());
 
+  // Slave in cleanup mode shouldn't reregister with slave and hence
+  // no offers should be made by the master.
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .Times(0);
+
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status));
+
+  Future<Nothing> _initialize = FUTURE_DISPATCH(_, &Slave::_initialize);
 
   // Restart the slave in 'cleanup' recovery mode with a new isolator.
   TypeParam isolator2;
@@ -838,6 +940,10 @@ TYPED_TEST(SlaveRecoveryTest, CleanupExecutor)
   // Scheduler should receive the TASK_FAILED update.
   AWAIT_READY(status);
   ASSERT_EQ(TASK_FAILED, status.get().state());
+
+  // Wait for recovery to complete.
+  AWAIT_READY(_initialize);
+  Clock::settle();
 
   Clock::resume();
 
@@ -1024,8 +1130,15 @@ TYPED_TEST(SlaveRecoveryTest, NonCheckpointingSlave)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.checkpoint = false;
 
+  Clock::pause();
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
   Try<PID<Slave> > slave = this->StartSlave(&isolator, flags);
   ASSERT_SOME(slave);
+
+  AWAIT_READY(registerSlaveMessage);
 
   MockScheduler sched;
 
@@ -1043,17 +1156,11 @@ TYPED_TEST(SlaveRecoveryTest, NonCheckpointingSlave)
   EXPECT_CALL(sched, resourceOffers(_, _))
     .Times(0); // No offers should be received!
 
-  Future<Nothing> offer = FUTURE_DISPATCH(_, &Master::offer);
-
-  Clock::pause();
-
   driver.start();
 
-  AWAIT_READY(registered);
-
-  // Wait for an offer to be made. We do a Clock::settle() here
+  // Wait for scheduler to register. We do a Clock::settle() here
   // to ensure that no offers are received by the scheduler.
-  AWAIT_READY(offer);
+  AWAIT_READY(registered);
   Clock::settle();
 
   driver.stop();
@@ -1176,8 +1283,9 @@ TYPED_TEST(SlaveRecoveryTest, KillTask)
 
 
 // When the slave is down we remove the "latest" symlink in the
-// executor's run directory, to simulate a situation where the slave
-// cannot recover the executor and hence schedules it for gc.
+// executor's run directory, to simulate a situation where the
+// recovered slave (--no-strict) cannot recover the executor and
+// hence schedules it for gc.
 TYPED_TEST(SlaveRecoveryTest, GCExecutor)
 {
   Try<PID<Master> > master = this->StartMaster();
@@ -1186,6 +1294,7 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
   TypeParam isolator1;
 
   slave::Flags flags = this->CreateSlaveFlags();
+  flags.strict = false;
 
   Try<PID<Slave> > slave = this->StartSlave(&isolator1, flags);
   ASSERT_SOME(slave);
@@ -1354,6 +1463,9 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
   UPID executorPid = registerExecutor.get().from;
 
   AWAIT_READY(statusUpdate1); // Wait for TASK_RUNNING update.
+
+  EXPECT_CALL(sched, offerRescinded(_, _))
+    .Times(AtMost(1));
 
   Future<Nothing> executorTerminated =
     FUTURE_DISPATCH(_, &Slave::executorTerminated);
@@ -1578,6 +1690,857 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileKillTask)
   // Scheduler should get a TASK_KILLED message.
   AWAIT_READY(status);
   ASSERT_EQ(TASK_KILLED, status.get().state());
+
+  driver.stop();
+  driver.join();
+
+  this->Shutdown(); // Shutdown before isolator(s) get deallocated.
+}
+
+
+// This test verifies that when the slave recovers and re-registers
+// with a framework that was shutdown when the slave was down, it gets
+// a ShutdownFramework message.
+TYPED_TEST(SlaveRecoveryTest, ReconcileShutdownFramework)
+{
+  Try<PID<Master> > master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
+  TypeParam isolator1;
+
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  Try<PID<Slave> > slave = this->StartSlave(&isolator1, flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(registerSlaveMessage);
+
+  MockScheduler sched;
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  frameworkInfo.set_checkpoint(true);
+
+  MesosSchedulerDriver driver(&sched, frameworkInfo, master.get());
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  // Capture the slave and framework ids.
+  SlaveID slaveId = offers.get()[0].slave_id();
+  FrameworkID frameworkId = offers.get()[0].framework_id();
+
+  EXPECT_CALL(sched, statusUpdate(_, _)); // TASK_RUNNING
+
+  Future<Nothing> _statusUpdateAcknowledgement =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  vector<TaskInfo> tasks;
+  tasks.push_back(task); // Long-running task
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  // Wait for TASK_RUNNING update to be acknowledged.
+  AWAIT_READY(_statusUpdateAcknowledgement);
+
+  this->Stop(slave.get());
+
+  Future<UnregisterFrameworkMessage> unregisterFrameworkMessage =
+    FUTURE_PROTOBUF(UnregisterFrameworkMessage(), _, _);
+
+  // Now stop the framework.
+  driver.stop();
+  driver.join();
+
+  // Wait util the framework is removed.
+  AWAIT_READY(unregisterFrameworkMessage);
+
+  Future<ShutdownFrameworkMessage> shutdownFrameworkMessage =
+    FUTURE_PROTOBUF(ShutdownFrameworkMessage(), _, _);
+
+  Future<Nothing> executorTerminated =
+    FUTURE_DISPATCH(_, &Slave::executorTerminated);
+
+  // Now restart the slave (use same flags) with a new isolator.
+  TypeParam isolator2;
+
+  slave = this->StartSlave(&isolator2, flags);
+  ASSERT_SOME(slave);
+
+  // Slave should get a ShutdownFrameworkMessage.
+  AWAIT_READY(shutdownFrameworkMessage);
+
+  // Ensure that the executor is terminated.
+  AWAIT_READY(executorTerminated);
+
+  this->Shutdown(); // Shutdown before isolator(s) get deallocated.
+}
+
+// Scheduler asks a restarted slave to kill a task that has been
+// running before the slave restarted. A scheduler failover happens
+// when the slave is down. This test verifies that a scheduler
+// failover will not affect the slave recovery process.
+TYPED_TEST(SlaveRecoveryTest, SchedulerFailover)
+{
+  Try<PID<Master> > master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  TypeParam isolator1;
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  Try<PID<Slave> > slave = this->StartSlave(&isolator1, flags);
+  ASSERT_SOME(slave);
+
+  // Launch the first (i.e., failing) scheduler.
+  MockScheduler sched1;
+
+  FrameworkInfo framework1;
+  framework1.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  framework1.set_checkpoint(true);
+
+  MesosSchedulerDriver driver1(&sched1, framework1, master.get());
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched1, registered(&driver1, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer> > offers1;
+  EXPECT_CALL(sched1, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1));
+
+  driver1.start();
+
+  AWAIT_READY(frameworkId);
+  AWAIT_READY(offers1);
+  EXPECT_NE(0u, offers1.get().size());
+
+  // Create a long running task.
+  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  EXPECT_CALL(sched1, statusUpdate(_, _));
+
+  Future<Nothing> _statusUpdateAcknowledgement =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver1.launchTasks(offers1.get()[0].id(), tasks);
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement);
+
+  this->Stop(slave.get());
+
+  // Now launch the second (i.e., failover) scheduler using the
+  // framework id recorded from the first scheduler.
+  MockScheduler sched2;
+
+  FrameworkInfo framework2;
+  framework2.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  framework2.mutable_id()->MergeFrom(frameworkId.get());
+  framework2.set_checkpoint(true);
+
+  MesosSchedulerDriver driver2(&sched2, framework2, master.get());
+
+  Future<Nothing> sched2Registered;
+  EXPECT_CALL(sched2, registered(&driver2, frameworkId.get(), _))
+    .WillOnce(FutureSatisfy(&sched2Registered));
+
+  Future<Nothing> sched1Error;
+  EXPECT_CALL(sched1, error(&driver1, "Framework failed over"))
+    .WillOnce(FutureSatisfy(&sched1Error));
+
+  driver2.start();
+
+  AWAIT_READY(sched2Registered);
+  AWAIT_READY(sched1Error);
+
+  Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
+
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+      FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  // Restart the slave (use same flags) with a new isolator.
+  TypeParam isolator2;
+
+  slave = this->StartSlave(&isolator2, flags);
+  ASSERT_SOME(slave);
+
+  Clock::pause();
+
+  AWAIT_READY(_recover);
+
+  Clock::settle(); // Wait for slave to schedule reregister timeout.
+
+  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+
+  // Wait for the slave to re-register.
+  AWAIT_READY(reregisterSlaveMessage);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched2, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());        // Ignore subsequent updates.
+
+  Future<vector<Offer> > offers2;
+  EXPECT_CALL(sched2, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return());        // Ignore subsequent offers.
+
+   // Kill the task.
+  driver2.killTask(task.task_id());
+
+  // Wait for TASK_KILLED update.
+  AWAIT_READY(status);
+  ASSERT_EQ(TASK_KILLED, status.get().state());
+
+  // Advance the clock until the allocator allocates
+  // the recovered resources.
+  while (offers2.isPending()) {
+    Clock::advance(Seconds(1));
+    Clock::settle();
+  }
+
+  // Make sure all slave resources are reoffered.
+  AWAIT_READY(offers2);
+  ASSERT_EQ(Resources(offers1.get()[0].resources()),
+            Resources(offers2.get()[0].resources()));
+
+  Clock::resume();
+
+  driver2.stop();
+  driver2.join();
+
+  driver1.stop();
+  driver1.join();
+
+  this->Shutdown(); // Shutdown before isolator(s) get deallocated.
+}
+
+
+// The purpose of this test is to ensure that during a network
+// partition, the master will remove a partitioned slave. When the
+// partition is removed, the slave will receive a ShutdownMessage.
+// When the slave starts again on the same host, we verify that the
+// slave will not try to reregister itself with the master. It will
+// register itself with the master and get a new slave id.
+TYPED_TEST(SlaveRecoveryTest, PartitionedSlave)
+{
+  Try<PID<Master> > master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  // Set these expectations up before we spawn the slave so that we
+  // don't miss the first PING.
+  Future<Message> ping = FUTURE_MESSAGE(Eq("PING"), _, _);
+
+  // Drop all the PONGs to simulate slave partition.
+  DROP_MESSAGES(Eq("PONG"), _, _);
+
+  TypeParam isolator1;
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  Try<PID<Slave> > slave = this->StartSlave(&isolator1, flags);
+  ASSERT_SOME(slave);
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(&sched, frameworkInfo, master.get());
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_NE(0u, offers.get().size());
+
+  // Long running task.
+  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  EXPECT_CALL(sched, statusUpdate(_, _));
+
+  Future<Nothing> _statusUpdateAcknowledgement =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement);
+
+  Future<ShutdownMessage> shutdownMessage =
+    FUTURE_PROTOBUF(ShutdownMessage(), _, slave.get());
+
+  Future<Nothing> slaveLost;
+  EXPECT_CALL(sched, slaveLost(&driver, _))
+    .WillOnce(FutureSatisfy(&slaveLost));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  Future<Nothing> executorTerminated =
+    FUTURE_DISPATCH(_, &Slave::executorTerminated);
+
+  Clock::pause();
+
+  // Now, induce a partition of the slave by having the master
+  // timeout the slave.
+  uint32_t pings = 0;
+  while (true) {
+    AWAIT_READY(ping);
+    pings++;
+    if (pings == master::MAX_SLAVE_PING_TIMEOUTS) {
+     break;
+    }
+    ping = FUTURE_MESSAGE(Eq("PING"), _, _);
+    Clock::advance(master::SLAVE_PING_TIMEOUT);
+    Clock::settle();
+  }
+
+  Clock::advance(master::SLAVE_PING_TIMEOUT);
+  Clock::settle();
+
+  // The master will notify the framework that the slave was lost.
+  AWAIT_READY(slaveLost);
+
+  // The master will have notified the framework of the lost task.
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_LOST, status.get().state());
+
+  // Wait for the master to attempt to shut down the slave.
+  AWAIT_READY(shutdownMessage);
+
+  // Wait for the executor to be terminated.
+  while (executorTerminated.isPending()) {
+    Clock::advance(Seconds(1));
+    Clock::settle();
+  }
+
+  AWAIT_READY(executorTerminated);
+  Clock::settle();
+
+  this->Stop(slave.get());
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
+  // Restart the slave (use same flags) with a new isolator.
+  TypeParam isolator2;
+
+  slave = this->StartSlave(&isolator2, flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(registerSlaveMessage);
+
+  Clock::resume();
+
+  driver.stop();
+  driver.join();
+
+  this->Shutdown(); // Shutdown before isolator(s) get deallocated.
+}
+
+
+// This test verifies that if the master changes when the slave is
+// down, the slave can still recover the task when it restarts. We
+// verify its correctness by killing the task from the scheduler.
+TYPED_TEST(SlaveRecoveryTest, MasterFailover)
+{
+  // Step 1. Run a task.
+  Try<PID<Master> > master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  TypeParam isolator1;
+
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  Try<PID<Slave> > slave = this->StartSlave(&isolator1, flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  frameworkInfo.set_checkpoint(true);
+
+  MesosSchedulerDriver driver(&sched, frameworkInfo, master.get());
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer> > offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1));
+
+  Future<process::Message> frameworkRegisteredMessage =
+    FUTURE_MESSAGE(Eq(FrameworkRegisteredMessage().GetTypeName()), _, _);
+
+  driver.start();
+
+  AWAIT_READY(frameworkRegisteredMessage);
+  AWAIT_READY(offers1);
+  EXPECT_NE(0u, offers1.get().size());
+
+  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  vector<TaskInfo> tasks;
+  tasks.push_back(task); // Long-running task
+
+  EXPECT_CALL(sched, statusUpdate(_, _));
+
+  Future<Nothing> _statusUpdateAcknowledgement =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver.launchTasks(offers1.get()[0].id(), tasks);
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement);
+
+  this->Stop(slave.get());
+
+  // Step 2. Simulate failed over master by restarting the master.
+  this->Stop(master.get());
+  master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  // Simulate a new master detected message to the scheduler.
+  NewMasterDetectedMessage newMasterDetectedMsg;
+  newMasterDetectedMsg.set_pid(master.get());
+
+  process::post(frameworkRegisteredMessage.get().to, newMasterDetectedMsg);
+
+  // Framework should get a registered callback.
+  AWAIT_READY(registered);
+
+  // Step 3. Restart the slave and kill the task.
+  Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
+
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  // Restart the slave (use same flags) with a new isolator.
+  TypeParam isolator2;
+
+  slave = this->StartSlave(&isolator2, flags);
+  ASSERT_SOME(slave);
+
+  Clock::pause();
+
+  AWAIT_READY(_recover);
+
+  Clock::settle(); // Wait for slave to schedule reregister timeout.
+
+  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+
+  // Wait for the slave to re-register.
+  AWAIT_READY(reregisterSlaveMessage);
+
+  Clock::resume();
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());        // Ignore subsequent updates.
+
+  Future<vector<Offer> > offers2;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return());        // Ignore subsequent offers.
+
+  // Wait for the executor to terminate before shutting down the
+  // slave in order to give cgroups (if applicable) time to clean up.
+  Future<Nothing> executorTerminated =
+    FUTURE_DISPATCH(_, &Slave::executorTerminated);
+
+  // Kill the task.
+  driver.killTask(task.task_id());
+
+  // Wait for TASK_KILLED update.
+  AWAIT_READY(status);
+  ASSERT_EQ(TASK_KILLED, status.get().state());
+
+  // Make sure all slave resources are reoffered.
+  AWAIT_READY(offers2);
+  ASSERT_EQ(Resources(offers1.get()[0].resources()),
+            Resources(offers2.get()[0].resources()));
+
+  AWAIT_READY(executorTerminated);
+
+  driver.stop();
+  driver.join();
+
+  this->Shutdown(); // Shutdown before isolator(s) get deallocated.
+}
+
+
+// In this test there are two frameworks and one slave. Each
+// framework launches a task before the slave goes down. We verify
+// that the two frameworks and their tasks are recovered after the
+// slave restarts.
+TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
+{
+  Try<PID<Master> > master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  TypeParam isolator1;
+
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  Try<PID<Slave> > slave = this->StartSlave(&isolator1, flags);
+  ASSERT_SOME(slave);
+
+  // Framework 1.
+  MockScheduler sched1;
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo1;
+  frameworkInfo1.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  frameworkInfo1.set_checkpoint(true);
+
+  MesosSchedulerDriver driver1(&sched1, frameworkInfo1, master.get());
+
+  EXPECT_CALL(sched1, registered(_, _, _));
+
+  Future<vector<Offer> > offers1;
+  EXPECT_CALL(sched1, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return());      // Ignore subsequent offers.
+
+  driver1.start();
+
+  AWAIT_READY(offers1);
+  EXPECT_NE(0u, offers1.get().size());
+
+  // Use part of the resources in the offer so that the rest can be
+  // offered to framework 2.
+  Offer offer1 = offers1.get()[0];
+  offer1.mutable_resources()->CopyFrom(
+      Resources::parse("cpus:1;mem:512").get());
+
+  // Framework 1 launches a task.
+  TaskInfo task1 = createTask(offer1, "sleep 1000");
+  vector<TaskInfo> tasks1;
+  tasks1.push_back(task1); // Long-running task
+
+  EXPECT_CALL(sched1, statusUpdate(_, _));
+
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver1.launchTasks(offer1.id(), tasks1);
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+
+  // Framework 2.
+  MockScheduler sched2;
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo2;
+  frameworkInfo2.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  frameworkInfo2.set_checkpoint(true);
+
+  MesosSchedulerDriver driver2(&sched2, frameworkInfo2, master.get());
+
+  EXPECT_CALL(sched2, registered(_, _, _));
+
+  Future<vector<Offer> > offers2;
+  EXPECT_CALL(sched2, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return());      // Ignore subsequent offers.
+
+  driver2.start();
+
+  AWAIT_READY(offers2);
+  EXPECT_NE(0u, offers2.get().size());
+
+  // Framework 2 launches a task.
+  TaskInfo task2 = createTask(offers2.get()[0], "sleep 1000");
+
+  vector<TaskInfo> tasks2;
+  tasks2.push_back(task2); // Long-running task
+
+  EXPECT_CALL(sched2, statusUpdate(_, _));
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+  driver2.launchTasks(offers2.get()[0].id(), tasks2);
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement2);
+
+  this->Stop(slave.get());
+
+  Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
+
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  // Restart the slave (use same flags) with a new isolator.
+  TypeParam isolator2;
+
+  slave = this->StartSlave(&isolator2, flags);
+  ASSERT_SOME(slave);
+
+  Clock::pause();
+
+  AWAIT_READY(_recover);
+
+  Clock::settle(); // Wait for slave to schedule reregister timeout.
+
+  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+
+  // Wait for the slave to re-register.
+  AWAIT_READY(reregisterSlaveMessage);
+
+  Clock::resume();
+
+  // Expectations for the status changes as a result of killing the
+  // tasks.
+  Future<TaskStatus> status1;
+  EXPECT_CALL(sched1, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&status1))
+    .WillRepeatedly(Return());        // Ignore subsequent updates.
+
+  Future<TaskStatus> status2;
+  EXPECT_CALL(sched2, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&status2))
+    .WillRepeatedly(Return());        // Ignore subsequent updates.
+
+  // Wait for the executors to terminate before shutting down the
+  // slave in order to give cgroups (if applicable) time to clean up.
+  Future<Nothing> executorTerminated1 =
+    FUTURE_DISPATCH(_, &Slave::executorTerminated);
+  Future<Nothing> executorTerminated2 =
+    FUTURE_DISPATCH(_, &Slave::executorTerminated);
+
+  // Kill task 1.
+  driver1.killTask(task1.task_id());
+
+  // Wait for TASK_KILLED update.
+  AWAIT_READY(status1);
+  ASSERT_EQ(TASK_KILLED, status1.get().state());
+
+  // Kill task 2.
+  driver2.killTask(task2.task_id());
+
+  // Wait for TASK_KILLED update.
+  AWAIT_READY(status2);
+  ASSERT_EQ(TASK_KILLED, status2.get().state());
+
+  AWAIT_READY(executorTerminated1);
+  AWAIT_READY(executorTerminated2);
+
+  driver1.stop();
+  driver1.join();
+  driver2.stop();
+  driver2.join();
+
+  this->Shutdown(); // Shutdown before isolator(s) get deallocated.
+}
+
+
+// Create a test fixture for those slave recovery tests that only work
+// when ProcessIsolator is used.
+// TODO(jieyu): We use typed test here because it magically allows us
+// to access protected members in Slave (e.g. Slave::_recover).
+template <typename T>
+class SlaveRecoveryProcessIsolatorTest : public IsolatorTest<T>
+{
+public:
+  virtual slave::Flags CreateSlaveFlags()
+  {
+    slave::Flags flags = IsolatorTest<T>::CreateSlaveFlags();
+
+    // Setup recovery slave flags.
+    flags.checkpoint = true;
+    flags.recover = "reconnect";
+    flags.strict = true;
+
+    return flags;
+  }
+};
+
+
+TYPED_TEST_CASE(SlaveRecoveryProcessIsolatorTest,
+                ::testing::Types<ProcessIsolator>);
+
+
+// This test verifies that slave recovery works properly even if
+// multiple slaves are co-located on the same host.
+TYPED_TEST(SlaveRecoveryProcessIsolatorTest, MultipleSlaves)
+{
+  Try<PID<Master> > master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.CopyFrom(DEFAULT_FRAMEWORK_INFO);
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(&sched, frameworkInfo, master.get());
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  driver.start();
+
+  Future<vector<Offer> > offers1;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers1));
+
+  // Start the first slave.
+  slave::Flags flags1 = this->CreateSlaveFlags();
+  slave::ProcessIsolator isolator1;
+
+  Try<PID<Slave> > slave1 = this->StartSlave(&isolator1, flags1);
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(offers1);
+  ASSERT_EQ(1u, offers1.get().size());
+
+  // Launch a long running task in the first slave.
+  TaskInfo task1 = createTask(offers1.get()[0], "sleep 1000");
+  vector<TaskInfo> tasks1;
+  tasks1.push_back(task1);
+
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(1);
+
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(slave1.get(), &Slave::_statusUpdateAcknowledgement);
+
+  driver.launchTasks(offers1.get()[0].id(), tasks1);
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+
+  Future<vector<Offer> > offers2;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers2));
+
+  // Start the second slave.
+  slave::Flags flags2 = this->CreateSlaveFlags();
+  slave::ProcessIsolator isolator2;
+
+  Try<PID<Slave> > slave2 = this->StartSlave(&isolator2, flags2);
+  ASSERT_SOME(slave2);
+
+  AWAIT_READY(offers2);
+  ASSERT_EQ(1u, offers2.get().size());
+
+  // Launch a long running task in each slave.
+  TaskInfo task2 = createTask(offers2.get()[0], "sleep 1000");
+  vector<TaskInfo> tasks2;
+  tasks2.push_back(task2);
+
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(1);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(slave2.get(), &Slave::_statusUpdateAcknowledgement);
+
+  driver.launchTasks(offers2.get()[0].id(), tasks2);
+
+  // Wait for the ACKs to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement2);
+
+  this->Stop(slave1.get());
+  this->Stop(slave2.get());
+
+  Future<Nothing> _recover1 = FUTURE_DISPATCH(_, &Slave::_recover);
+  Future<Nothing> _recover2 = FUTURE_DISPATCH(_, &Slave::_recover);
+
+  Future<ReregisterSlaveMessage> reregisterSlave1 =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+  Future<ReregisterSlaveMessage> reregisterSlave2 =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  // Restart both slaves using the same flags with new isolators.
+  slave::ProcessIsolator isolator3;
+
+  slave1 = this->StartSlave(&isolator3, flags1);
+  ASSERT_SOME(slave1);
+
+  slave::ProcessIsolator isolator4;
+
+  slave2 = this->StartSlave(&isolator4, flags2);
+  ASSERT_SOME(slave2);
+
+  Clock::pause();
+
+  AWAIT_READY(_recover1);
+  AWAIT_READY(_recover2);
+
+  // Wait for slaves to schedule reregister timeout.
+  Clock::settle();
+
+  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+
+  // Make sure all pending timeouts are fired.
+  Clock::settle();
+
+  Clock::resume();
+
+  // Wait for the slaves to re-register.
+  AWAIT_READY(reregisterSlave1);
+  AWAIT_READY(reregisterSlave2);
+
+  Future<TaskStatus> status1;
+  Future<TaskStatus> status2;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&status1))
+    .WillOnce(FutureArg<1>(&status2))
+    .WillRepeatedly(Return());        // Ignore subsequent updates.
+
+  Future<Nothing> executorTerminated1 =
+    FUTURE_DISPATCH(_, &Slave::executorTerminated);
+  Future<Nothing> executorTerminated2 =
+    FUTURE_DISPATCH(_, &Slave::executorTerminated);
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillRepeatedly(Return());        // Ignore subsequent offers.
+
+  // Kill both tasks.
+  driver.killTask(task1.task_id());
+  driver.killTask(task2.task_id());
+
+  AWAIT_READY(status1);
+  ASSERT_EQ(TASK_KILLED, status1.get().state());
+
+  AWAIT_READY(status2);
+  ASSERT_EQ(TASK_KILLED, status2.get().state());
+
+  AWAIT_READY(executorTerminated1);
+  AWAIT_READY(executorTerminated2);
 
   driver.stop();
   driver.join();

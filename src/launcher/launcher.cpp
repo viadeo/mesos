@@ -68,7 +68,8 @@ ExecutorLauncher::ExecutorLauncher(
     const string& _hadoopHome,
     bool _redirectIO,
     bool _shouldSwitchUser,
-    bool _checkpoint)
+    bool _checkpoint,
+    Duration _recoveryTimeout)
   : slaveId(_slaveId),
     frameworkId(_frameworkId),
     executorId(_executorId),
@@ -82,7 +83,8 @@ ExecutorLauncher::ExecutorLauncher(
     hadoopHome(_hadoopHome),
     redirectIO(_redirectIO),
     shouldSwitchUser(_shouldSwitchUser),
-    checkpoint (_checkpoint) {}
+    checkpoint(_checkpoint),
+    recoveryTimeout(_recoveryTimeout) {}
 
 
 ExecutorLauncher::~ExecutorLauncher() {}
@@ -105,8 +107,17 @@ int ExecutorLauncher::setup()
         frameworkId,
         executorId,
         uuid);
-    cout << "Checkpointing forked pid " << getpid() << endl;
-    slave::state::checkpoint(path, stringify(getpid()));
+    cout << "Checkpointing executor's forked pid " << getpid()
+         << " to '" << path <<  "'" << endl;
+
+    Try<Nothing> checkpoint =
+      slave::state::checkpoint(path, stringify(getpid()));
+
+    if (checkpoint.isError()) {
+      cerr << "Failed to checkpoint executor's forked pid to '"
+           << path << "': " << checkpoint.error();
+      return -1;
+    }
   }
 
   const string& cwd = os::getcwd();
@@ -124,7 +135,7 @@ int ExecutorLauncher::setup()
   }
 
   // Enter working directory.
-  if (os::chdir(workDirectory) < 0) {
+  if (!os::chdir(workDirectory)) {
     cerr << "Failed to chdir into executor work directory" << endl;
     return -1;
   }
@@ -149,7 +160,7 @@ int ExecutorLauncher::setup()
   }
 
   // Go back to previous directory.
-  if (os::chdir(cwd) < 0) {
+  if (!os::chdir(cwd)) {
     cerr << "Failed to chdir (back) into slave directory" << endl;
     return -1;
   }
@@ -446,6 +457,10 @@ map<string, string> ExecutorLauncher::getEnvironment()
   env["MESOS_EXECUTOR_ID"] = executorId.value();
   env["MESOS_EXECUTOR_UUID"] = uuid.toString();
   env["MESOS_CHECKPOINT"] = checkpoint ? "1" : "0";
+
+  if (checkpoint) {
+    env["MESOS_RECOVERY_TIMEOUT"] = stringify(recoveryTimeout);
+  }
 
   return env;
 }

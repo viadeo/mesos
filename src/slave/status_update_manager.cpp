@@ -242,7 +242,7 @@ Future<Nothing> StatusUpdateManagerProcess::recover(
           cleanupStatusUpdateStream(task.id, framework.id);
         } else {
           // If a stream has pending updates after the replay,
-          // send the first pending update
+          // send the first pending update.
           const Result<StatusUpdate>& next = stream->next();
           CHECK(!next.isError());
           if (next.isSome()) {
@@ -297,8 +297,7 @@ Future<Nothing> StatusUpdateManagerProcess::_update(
   const TaskID& taskId = update.status().task_id();
   const FrameworkID& frameworkId = update.framework_id();
 
-  LOG(INFO) << "Received status update " << update
-            << " with checkpoint=" << stringify(checkpoint);
+  LOG(INFO) << "Received status update " << update;
 
   // Write the status update to disk and enqueue it to send it to the master.
   // Create/Get the status update stream for this task.
@@ -318,9 +317,15 @@ Future<Nothing> StatusUpdateManagerProcess::_update(
   }
 
   // Handle the status update.
-  Try<Nothing> result = stream->update(update);
+  Try<bool> result = stream->update(update);
   if (result.isError()) {
     return Future<Nothing>::failed(result.error());
+  }
+
+  // We don't return a failed future here so that the slave can re-ack
+  // the duplicate update.
+  if (!result.get()) {
+    return Nothing();
   }
 
   // Forward the status update to the master if this is the first in the stream.
@@ -404,6 +409,10 @@ Future<bool> StatusUpdateManagerProcess::acknowledgement(
     return Future<bool>::failed(result.error());
   }
 
+  if (!result.get()) {
+    return Future<bool>::failed("Duplicate acknowledgement");
+  }
+
   // Reset the timeout.
   stream->timeout = None();
 
@@ -413,7 +422,9 @@ Future<bool> StatusUpdateManagerProcess::acknowledgement(
     return Future<bool>::failed(next.error());
   }
 
-  if (stream->terminated) {
+  bool terminated = stream->terminated;
+
+  if (terminated) {
     if (next.isSome()) {
       LOG(WARNING) << "Acknowledged a terminal"
                    << " status update " << update.get()
@@ -425,7 +436,7 @@ Future<bool> StatusUpdateManagerProcess::acknowledgement(
     stream->timeout = forward(next.get());
   }
 
-  return result.get();
+  return !terminated;
 }
 
 
@@ -457,8 +468,8 @@ StatusUpdateStream* StatusUpdateManagerProcess::createStatusUpdateStream(
     const Option<ExecutorID>& executorId,
     const Option<UUID>& uuid)
 {
-  LOG(INFO) << "Creating StatusUpdate stream for task " << taskId
-            << " of framework " << frameworkId;
+  VLOG(1) << "Creating StatusUpdate stream for task " << taskId
+          << " of framework " << frameworkId;
 
   StatusUpdateStream* stream = new StatusUpdateStream(
       taskId, frameworkId, slaveId, flags, checkpoint, executorId, uuid);
@@ -488,9 +499,9 @@ void StatusUpdateManagerProcess::cleanupStatusUpdateStream(
     const TaskID& taskId,
     const FrameworkID& frameworkId)
 {
-  LOG(INFO) << "Cleaning up status update stream"
-            << " for task " << taskId
-            << " of framework " << frameworkId;
+  VLOG(1) << "Cleaning up status update stream"
+          << " for task " << taskId
+          << " of framework " << frameworkId;
 
   CHECK(streams.contains(frameworkId))
     << "Cannot find the status update streams for framework " << frameworkId;

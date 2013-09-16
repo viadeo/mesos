@@ -32,6 +32,7 @@
 #include <stout/path.hpp>
 #include <stout/utils.hpp>
 #include <stout/uuid.hpp>
+#include <stout/lambda.hpp>
 
 #include "common/build.hpp"
 #include "common/date_utils.hpp"
@@ -44,17 +45,13 @@
 #include "master/flags.hpp"
 #include "master/master.hpp"
 
-namespace params = std::tr1::placeholders;
-
 using std::list;
 using std::string;
 using std::vector;
 
 using process::wait; // Necessary on some OS's to disambiguate.
 
-using std::tr1::cref;
-using std::tr1::bind;
-
+using std::tr1::shared_ptr;
 
 namespace mesos {
 namespace internal {
@@ -208,15 +205,50 @@ Master::~Master()
 {
   LOG(INFO) << "Shutting down master";
 
-  foreachvalue (Framework* framework, utils::copy(frameworks)) {
-    removeFramework(framework);
-  }
+  // Remove the frameworks.
+  // Note we are not deleting the pointers to the frameworks from the
+  // allocator or the roles because it is unnecessary bookkeeping at
+  // this point since we are shutting down.
+  foreachvalue (Framework* framework, frameworks) {
+    // Remove pointers to the framework's tasks in slaves.
+    foreachvalue (Task* task, utils::copy(framework->tasks)) {
+      Slave* slave = getSlave(task->slave_id());
+      // Since we only find out about tasks when the slave re-registers,
+      // it must be the case that the slave exists!
+      CHECK(slave != NULL);
+      removeTask(task);
+    }
 
-  foreachvalue (Slave* slave, utils::copy(slaves)) {
-    removeSlave(slave);
+    // Remove the framework's offers (if they weren't removed before).
+    foreach (Offer* offer, utils::copy(framework->offers)) {
+      removeOffer(offer);
+    }
+
+    delete framework;
   }
+  frameworks.clear();
 
   CHECK(offers.size() == 0);
+
+  foreachvalue (Slave* slave, slaves) {
+    LOG(INFO) << "Removing slave " << slave->id
+              << " (" << slave->info.hostname() << ")";
+
+    // Remove tasks that are in the slave but not in any framework.
+    // This could happen when the framework has yet to reregister
+    // after master failover.
+    foreachvalue (Task* task, utils::copy(slave->tasks)) {
+      removeTask(task);
+    }
+
+    // Kill the slave observer.
+    terminate(slave->observer);
+    wait(slave->observer);
+
+    delete slave->observer;
+    delete slave;
+  }
+  slaves.clear();
 
   terminate(whitelistWatcher);
   wait(whitelistWatcher);
@@ -407,19 +439,19 @@ void Master::initialize()
   // Setup HTTP routes.
   route("/health",
         Http::HEALTH_HELP,
-        bind(&Http::health, http, params::_1));
+        lambda::bind(&Http::health, http, lambda::_1));
   route("/redirect",
         Http::REDIRECT_HELP,
-        bind(&Http::redirect, http, params::_1));
+        lambda::bind(&Http::redirect, http, lambda::_1));
   route("/stats.json",
         None(),
-        bind(&Http::stats, http, params::_1));
+        lambda::bind(&Http::stats, http, lambda::_1));
   route("/state.json",
         None(),
-        bind(&Http::state, http, params::_1));
+        lambda::bind(&Http::state, http, lambda::_1));
   route("/roles.json",
         None(),
-        bind(&Http::roles, http, params::_1));
+        lambda::bind(&Http::roles, http, lambda::_1));
 
   // Provide HTTP assets from a "webui" directory. This is either
   // specified via flags (which is necessary for running out of the
@@ -435,7 +467,7 @@ void Master::initialize()
       LOG(ERROR) << "Master log file cannot be found: " << log.error();
     } else {
       files->attach(log.get(), "/master/log")
-        .onAny(defer(self(), &Self::fileAttached, params::_1, log.get()));
+        .onAny(defer(self(), &Self::fileAttached, lambda::_1, log.get()));
     }
   }
 }
@@ -444,9 +476,6 @@ void Master::initialize()
 void Master::finalize()
 {
   LOG(INFO) << "Master terminating";
-  foreachvalue (Slave* slave, slaves) {
-    send(slave->pid, ShutdownMessage());
-  }
 }
 
 
@@ -528,11 +557,7 @@ void Master::exited(const UPID& pid)
                   << "because it is not checkpointing!";
         removeSlave(slave);
         return;
-      } else {
-        CHECK(!slave->disconnected)
-              << "Slave " << slave->id << " ("
-              << slave->info.hostname() << ") already disconnected!" ;
-
+      } else if (!slave->disconnected) {
         // Mark the slave as disconnected and remove it from the allocator.
         slave->disconnected = true;
 
@@ -572,6 +597,10 @@ void Master::exited(const UPID& pid)
           // Remove and rescind offers.
           removeOffer(offer, true); // Rescind!
         }
+      } else {
+        LOG(WARNING) << "Ignoring duplicate exited() notification for "
+                     << "checkpointing slave " << slave->id
+                     << " (" << slave->info.hostname() << ")";
       }
     }
   }
@@ -875,6 +904,9 @@ void Master::launchTasks(const FrameworkID& frameworkId,
         status->set_message("Task launched with invalid offer");
         update->set_timestamp(Clock::now().secs());
         update->set_uuid(UUID::random().toBytes());
+
+        LOG(INFO) << "Sending status update " << *update
+                  << " for launch task attempt on invalid offer " << offerId;
         send(framework->pid, message);
       }
     }
@@ -944,6 +976,10 @@ void Master::killTask(const FrameworkID& frameworkId,
       update->set_uuid(UUID::random().toBytes());
       send(framework->pid, message);
     }
+  } else {
+    LOG(WARNING) << "Failed to kill task " << taskId
+                 << " of framework " << frameworkId
+                 << " because the framework cannot be found";
   }
 }
 
@@ -1072,6 +1108,8 @@ void Master::reregisterSlave(const SlaveID& slaveId,
   } else {
     Slave* slave = getSlave(slaveId);
     if (slave != NULL) {
+      slave->reregisteredTime = Clock::now();
+
       // NOTE: This handles the case where a slave tries to
       // re-register with an existing master (e.g. because of a
       // spurious Zookeeper session expiration or after the slave
@@ -1105,17 +1143,24 @@ void Master::reregisterSlave(const SlaveID& slaveId,
       reply(message);
 
       // Update the slave pid and relink to it.
+      // NOTE: Re-linking the slave here always rather than only when
+      // the slave is disconnected can lead to multiple exited events
+      // in succession for a disconnected slave. As a result, we
+      // ignore duplicate exited events for disconnected checkpointing
+      // slaves.
+      // See: https://issues.apache.org/jira/browse/MESOS-675
       slave->pid = from;
       link(slave->pid);
 
       // Reconcile tasks between master and the slave.
       // NOTE: This needs to be done after the registration message is
       // sent to the slave and the new pid is linked.
-      reconcileTasks(slave, tasks);
+      reconcile(slave, executorInfos, tasks);
     } else {
       // NOTE: This handles the case when the slave tries to
       // re-register with a failed over master.
       slave = new Slave(slaveInfo, slaveId, from, Clock::now());
+      slave->reregisteredTime = Clock::now();
 
       LOG(INFO) << "Attempting to re-register slave " << slave->id << " at "
                 << slave->pid << " (" << slave->info.hostname() << ")";
@@ -1163,10 +1208,7 @@ void Master::statusUpdate(const StatusUpdate& update, const UPID& pid)
   // NOTE: We cannot use 'from' here to identify the slave as this is
   // now sent by the StatusUpdateManagerProcess. Only 'pid' can
   // be used to identify the slave.
-  LOG(INFO) << "Status update from " << pid
-            << ": task " << status.task_id()
-            << " of framework " << update.framework_id()
-            << " is now in state " << status.state();
+  LOG(INFO) << "Status update " << update << " from " << pid;
 
   Slave* slave = getSlave(update.slave_id());
   if (slave == NULL) {
@@ -1174,12 +1216,14 @@ void Master::statusUpdate(const StatusUpdate& update, const UPID& pid)
       // If the slave is deactivated, we have already informed
       // frameworks that its tasks were LOST, so the slave should
       // shut down.
-      LOG(WARNING) << "Ignoring status update from deactivated slave " << pid
+      LOG(WARNING) << "Ignoring status update " << update
+                   << " from deactivated slave " << pid
                    << " with id " << update.slave_id() << " ; asking slave "
                    << " to shutdown";
       send(pid, ShutdownMessage());
     } else {
-      LOG(WARNING) << "Ignoring status update from unknown slave " << pid
+      LOG(WARNING) << "Ignoring status update " << update
+                   << " from unknown slave " << pid
                    << " with id " << update.slave_id();
     }
     stats.invalidStatusUpdates++;
@@ -1190,7 +1234,8 @@ void Master::statusUpdate(const StatusUpdate& update, const UPID& pid)
 
   Framework* framework = getFramework(update.framework_id());
   if (framework == NULL) {
-    LOG(WARNING) << "Ignoring status update from " << pid << " ("
+    LOG(WARNING) << "Ignoring status update " << update
+                 << " from " << pid << " ("
                  << slave->info.hostname() << "): error, couldn't lookup "
                  << "framework " << update.framework_id();
     stats.invalidStatusUpdates++;
@@ -1206,7 +1251,8 @@ void Master::statusUpdate(const StatusUpdate& update, const UPID& pid)
   // Lookup the task and see if we need to update anything locally.
   Task* task = slave->getTask(update.framework_id(), status.task_id());
   if (task == NULL) {
-    LOG(WARNING) << "Status update from " << pid << " ("
+    LOG(WARNING) << "Status update " << update
+                 << " from " << pid << " ("
                  << slave->info.hostname() << "): error, couldn't lookup "
                  << "task " << status.task_id();
     stats.invalidStatusUpdates++;
@@ -1225,10 +1271,11 @@ void Master::statusUpdate(const StatusUpdate& update, const UPID& pid)
 }
 
 
-void Master::exitedExecutor(const SlaveID& slaveId,
-                            const FrameworkID& frameworkId,
-                            const ExecutorID& executorId,
-                            int32_t status)
+void Master::exitedExecutor(
+    const SlaveID& slaveId,
+    const FrameworkID& frameworkId,
+    const ExecutorID& executorId,
+    int32_t status)
 {
   // Only update master's internal data structures here for properly accounting.
   // The TASK_LOST updates are handled by the slave.
@@ -1349,17 +1396,10 @@ void Master::offer(const FrameworkID& frameworkId,
 
     Slave* slave = slaves[slaveId];
 
-    // Do not offer a non-checkpointing slave's resources to a checkpointing
-    // framework. This is a short term fix until the following is resolved:
-    // https://issues.apache.org/jira/browse/MESOS-444.
-    if (framework->info.checkpoint() && !slave->info.checkpoint()) {
-      LOG(WARNING) << "Master returning resources offered to checkpointing "
-                   << "framework " << frameworkId << " because slave "
-                   << slaveId << " is not checkpointing";
-
-      allocator->resourcesRecovered(frameworkId, slaveId, offered);
-      continue;
-    }
+    CHECK(slave->info.checkpoint() || !framework->info.checkpoint())
+        << "Resources of non checkpointing slave " << slaveId
+        << " (" << slave->info.hostname() << ") are being offered to"
+        << " checkpointing framework " << frameworkId;
 
     // This could happen if the allocator dispatched 'Master::offer' before
     // it received 'Allocator::slaveRemoved' from the master.
@@ -1517,12 +1557,11 @@ struct ResourceUsageChecker : TaskInfoVisitor
     Resources taskResources = task.resources();
 
     if (!((usedResources + taskResources) <= offer->resources())) {
-      LOG(WARNING) << "Task " << task.task_id() << " attempted to use "
-                   << taskResources << " combined with already used "
-                   << usedResources << " is greater than offered "
-                   << offer->resources();
-
-      return TaskInfoError::some("Task uses more resources than offered");
+      return TaskInfoError::some(
+          "Task " + stringify(task.task_id()) + " attempted to use " +
+          stringify(taskResources) + " combined with already used " +
+          stringify(usedResources) + " is greater than offered " +
+          stringify(offer->resources()));
     }
 
     // Check this task's executor's resources.
@@ -1532,9 +1571,9 @@ struct ResourceUsageChecker : TaskInfoVisitor
       foreach (const Resource& resource, task.executor().resources()) {
         if (!Resources::isAllocatable(resource)) {
           // TODO(benh): Send back the invalid resources?
-          LOG(WARNING) << "Executor for task " << task.task_id()
-                       << " uses invalid resources " << resource;
-          return TaskInfoError::some("Task's executor uses invalid resources");
+          return TaskInfoError::some(
+              "Executor for task " + stringify(task.task_id()) +
+              " uses invalid resources " + stringify(resource));
         }
       }
 
@@ -1544,13 +1583,11 @@ struct ResourceUsageChecker : TaskInfoVisitor
         if (!slave->hasExecutor(framework->id, task.executor().executor_id())) {
           taskResources += task.executor().resources();
           if (!((usedResources + taskResources) <= offer->resources())) {
-            LOG(WARNING) << "Task " << task.task_id() << " + executor attempted"
-                         << " to use " << taskResources << " combined with"
-                         << " already used " << usedResources << " is greater"
-                         << " than offered " << offer->resources();
-
             return TaskInfoError::some(
-                "Task + executor uses more resources than offered");
+                "Task " + stringify(task.task_id()) + " + executor attempted" +
+                " to use " + stringify(taskResources) + " combined with" +
+                " already used " + stringify(usedResources) + " is greater" +
+                " than offered " + stringify(offer->resources()));
           }
         }
         executors.insert(task.executor().executor_id());
@@ -1590,7 +1627,14 @@ struct ExecutorInfoChecker : TaskInfoVisitor
         if (!(task.executor() == executorInfo)) {
           return TaskInfoError::some(
               "Task has invalid ExecutorInfo (existing ExecutorInfo"
-              " with same ExecutorID is not compatible)");
+              " with same ExecutorID is not compatible).\n"
+              "------------------------------------------------------------\n"
+              "Existing ExecutorInfo:\n" +
+              stringify(executorInfo) + "\n"
+              "------------------------------------------------------------\n"
+              "Task's ExecutorInfo:\n" +
+              stringify(task.executor()) + "\n"
+              "------------------------------------------------------------\n");
         }
       }
     }
@@ -1678,6 +1722,7 @@ void Master::processTasks(Offer* offer,
           TASK_LOST,
           error.get());
 
+      LOG(INFO) << "Sending status update " << update << " for invalid task";
       StatusUpdateMessage message;
       message.mutable_update()->CopyFrom(update);
       send(framework->pid, message);
@@ -1772,7 +1817,13 @@ Resources Master::launchTask(const TaskInfo& task,
 }
 
 
-void Master::reconcileTasks(Slave* slave, const vector<Task>& tasks)
+// NOTE: This function is only called when the slave re-registers
+// with a master that already knows about it (i.e., not a failed
+// over master).
+void Master::reconcile(
+    Slave* slave,
+    const vector<ExecutorInfo>& executors,
+    const vector<Task>& tasks)
 {
   CHECK_NOTNULL(slave);
 
@@ -1791,22 +1842,64 @@ void Master::reconcileTasks(Slave* slave, const vector<Task>& tasks)
     if (!slaveTasks.contains(task->framework_id(), task->task_id())) {
       LOG(WARNING) << "Sending TASK_LOST for task " << task->task_id()
                    << " of framework " << task->framework_id()
-                   << " unknown to the slave " << slave->id;
+                   << " unknown to the slave " << slave->id
+                   << " (" << slave->info.hostname() << ")";
 
-      Framework* framework = getFramework(task->framework_id());
-      if (framework != NULL) {
-        const StatusUpdate& update = protobuf::createStatusUpdate(
-            task->framework_id(),
+      const StatusUpdate& update = protobuf::createStatusUpdate(
+          task->framework_id(),
+          slave->id,
+          task->task_id(),
+          TASK_LOST,
+          "Task is unknown to the slave");
+
+      statusUpdate(update, UPID());
+    }
+  }
+
+  // Likewise, any executors that are present in the master but
+  // not present in the slave must be removed to correctly account
+  // for resources. First we index the executors for fast lookup below.
+  multihashmap<FrameworkID, ExecutorID> slaveExecutors;
+  foreach (const ExecutorInfo& executor, executors) {
+    // TODO(bmahler): The slave ensures the framework id is set in the
+    // framework info when re-registering. This can be killed in 0.15.0
+    // as we've added code in 0.14.0 to ensure the framework id is set
+    // in the scheduler driver.
+    if (!executor.has_framework_id()) {
+      LOG(ERROR) << "Slave " << slave->id
+                 << " (" << slave->info.hostname() << ") "
+                 << "re-registered with executor " << executor.executor_id()
+                 << " without setting the framework id";
+      continue;
+    }
+    slaveExecutors.put(executor.framework_id(), executor.executor_id());
+  }
+
+  // Now that we have the index for lookup, remove all the executors
+  // in the master that are not known to the slave.
+  foreachkey (const FrameworkID& frameworkId, utils::copy(slave->executors)) {
+    foreachkey (const ExecutorID& executorId,
+                utils::copy(slave->executors[frameworkId])) {
+      if (!slaveExecutors.contains(frameworkId, executorId)) {
+        LOG(WARNING) << "Removing executor " << executorId << " of framework "
+                     << frameworkId << " as it is unknown to the slave "
+                     << slave->id << " (" << slave->info.hostname() << ")";
+
+        // TODO(bmahler): This is duplicated in several locations, we
+        // may benefit from a method for removing an executor from
+        // all the relevant data structures and the allocator, akin
+        // to removeTask().
+        allocator->resourcesRecovered(
+            frameworkId,
             slave->id,
-            task->task_id(),
-            TASK_LOST,
-            "Task was not received by the slave");
+            slave->executors[frameworkId][executorId].resources());
 
-        StatusUpdateMessage message;
-        message.mutable_update()->CopyFrom(update);
-        send(framework->pid, message);
+        slave->removeExecutor(frameworkId, executorId);
+
+        if (frameworks.contains(frameworkId)) {
+          frameworks[frameworkId]->removeExecutor(slave->id, executorId);
+        }
       }
-      removeTask(task);
     }
   }
 
@@ -1824,6 +1917,27 @@ void Master::reconcileTasks(Slave* slave, const vector<Task>& tasks)
       KillTaskMessage message;
       message.mutable_framework_id()->MergeFrom(task.framework_id());
       message.mutable_task_id()->MergeFrom(task.task_id());
+      send(slave->pid, message);
+    }
+  }
+
+  // Send ShutdownFrameworkMessages for frameworks that are completed.
+  // This could happen if the message wasn't received by the slave
+  // (e.g., slave was down, partitioned).
+  // NOTE: This is a short-term hack because this information is lost
+  // when the master fails over. Also, 'completedFrameworks' has a
+  // limited capacity.
+  // TODO(vinod): Revisit this when registrar is in place. It would
+  // likely involve storing this information in the registrar.
+  foreach (const shared_ptr<Framework>& framework, completedFrameworks) {
+    if (slaveTasks.contains(framework->id)) {
+      LOG(WARNING)
+        << "Slave " << slave->id << " (" << slave->info.hostname()
+        << ") re-registered with completed framework " << framework->id
+        << ". Shutting down the framework on the slave";
+
+      ShutdownFrameworkMessage message;
+      message.mutable_framework_id()->MergeFrom(framework->id);
       send(slave->pid, message);
     }
   }
@@ -1900,6 +2014,10 @@ void Master::failoverFramework(Framework* framework, const UPID& newPid)
 
 void Master::removeFramework(Framework* framework)
 {
+  CHECK_NOTNULL(framework);
+
+  LOG(INFO) << "Removing framework " << framework->id;
+
   if (framework->active) {
     // Tell the allocator to stop allocating resources to this framework.
     allocator->frameworkDeactivated(framework->id);
@@ -1968,6 +2086,10 @@ void Master::removeFramework(Slave* slave, Framework* framework)
   CHECK_NOTNULL(slave);
   CHECK_NOTNULL(framework);
 
+  LOG(INFO) << "Removing framework " << framework->id
+            << " from slave " << slave->id
+            << " (" << slave->info.hostname() << ")";
+
   // Remove pointers to framework's tasks in slaves, and send status updates.
   foreachvalue (Task* task, utils::copy(slave->tasks)) {
     // Remove tasks that belong to this framework.
@@ -1975,25 +2097,16 @@ void Master::removeFramework(Slave* slave, Framework* framework)
       // A framework might not actually exist because the master failed
       // over and the framework hasn't reconnected yet. For more info
       // please see the comments in 'removeFramework(Framework*)'.
-      StatusUpdateMessage message;
-      message.mutable_update()->CopyFrom(
-          protobuf::createStatusUpdate(
-              task->framework_id(),
-              task->slave_id(),
-              task->task_id(),
-              TASK_LOST,
-              "Slave " + slave->info.hostname() + " disconnected",
-              (task->has_executor_id() ?
-                  Option<ExecutorID>(task->executor_id()) : None())));
+      const StatusUpdate& update = protobuf::createStatusUpdate(
+        task->framework_id(),
+        task->slave_id(),
+        task->task_id(),
+        TASK_LOST,
+        "Slave " + slave->info.hostname() + " disconnected",
+        (task->has_executor_id()
+            ? Option<ExecutorID>(task->executor_id()) : None()));
 
-      LOG(INFO) << "Sending status update " << message.update()
-                << " due to disconnected slave " << slave->id
-                << " (" << slave->info.hostname() << ")";
-
-      send(framework->pid, message);
-
-      // Remove the task from slave and framework.
-      removeTask(task);
+      statusUpdate(update, UPID());
     }
   }
 
@@ -2129,6 +2242,9 @@ void Master::removeSlave(Slave* slave)
 {
   CHECK_NOTNULL(slave);
 
+  LOG(INFO) << "Removing slave " << slave->id
+            << " (" << slave->info.hostname() << ")";
+
   // We do this first, to make sure any of the resources recovered
   // below (e.g., removeTask()) are ignored by the allocator.
   if (!slave->disconnected) {
@@ -2137,8 +2253,6 @@ void Master::removeSlave(Slave* slave)
 
   // Remove pointers to slave's tasks in frameworks, and send status updates
   foreachvalue (Task* task, utils::copy(slave->tasks)) {
-    Framework* framework = getFramework(task->framework_id());
-
     // A framework might not actually exist because the master failed
     // over and the framework hasn't reconnected. This can be a tricky
     // situation for frameworks that want to have high-availability,
@@ -2147,25 +2261,16 @@ void Master::removeSlave(Slave* slave)
     // want to do is create a local Framework object to represent that
     // framework until it fails over. See the TODO above in
     // Master::reregisterSlave.
-    if (framework != NULL) {
-      StatusUpdateMessage message;
-      message.mutable_update()->CopyFrom(
-          protobuf::createStatusUpdate(
-              task->framework_id(),
-              task->slave_id(),
-              task->task_id(),
-              TASK_LOST,
-              "Slave " + slave->info.hostname() + " removed",
-              (task->has_executor_id() ?
-                  Option<ExecutorID>(task->executor_id()) : None())));
+    const StatusUpdate& update = protobuf::createStatusUpdate(
+        task->framework_id(),
+        task->slave_id(),
+        task->task_id(),
+        TASK_LOST,
+        "Slave " + slave->info.hostname() + " removed",
+        (task->has_executor_id() ?
+            Option<ExecutorID>(task->executor_id()) : None()));
 
-      LOG(INFO) << "Sending status update " << message.update()
-                << " due to the removal of slave "
-                << slave->id << " (" << slave->info.hostname() << ")";
-
-      send(framework->pid, message);
-    }
-    removeTask(task);
+    statusUpdate(update, UPID());
   }
 
   foreach (Offer* offer, utils::copy(slave->offers)) {
@@ -2265,31 +2370,19 @@ void Master::removeOffer(Offer* offer, bool rescind)
 
 Framework* Master::getFramework(const FrameworkID& frameworkId)
 {
-  if (frameworks.count(frameworkId) > 0) {
-    return frameworks[frameworkId];
-  } else {
-    return NULL;
-  }
+  return frameworks.contains(frameworkId) ? frameworks[frameworkId] : NULL;
 }
 
 
 Slave* Master::getSlave(const SlaveID& slaveId)
 {
-  if (slaves.count(slaveId) > 0) {
-    return slaves[slaveId];
-  } else {
-    return NULL;
-  }
+  return slaves.contains(slaveId) ? slaves[slaveId] : NULL;
 }
 
 
 Offer* Master::getOffer(const OfferID& offerId)
 {
-  if (offers.count(offerId) > 0) {
-    return offers[offerId];
-  } else {
-    return NULL;
-  }
+  return offers.contains(offerId) ? offers[offerId] : NULL;
 }
 
 

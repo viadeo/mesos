@@ -136,7 +136,8 @@ void ProcessIsolator::launchExecutor(
       flags.hadoop_home,
       !local,
       flags.switch_user,
-      frameworkInfo.checkpoint());
+      frameworkInfo.checkpoint(),
+      flags.recovery_timeout);
 
   // We get the environment map for launching mesos-launcher before
   // the fork, because we have seen deadlock issues with ostringstream
@@ -191,8 +192,6 @@ void ProcessIsolator::launchExecutor(
 
       if (pid > 0) {
         // In parent process.
-        // It is ok to suicide here, though process reaper signals the exit,
-        // because the process isolator ignores unknown processes.
         exit(0);
       }
     }

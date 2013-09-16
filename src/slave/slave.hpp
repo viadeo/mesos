@@ -34,6 +34,7 @@
 #include <process/protobuf.hpp>
 
 #include <stout/bytes.hpp>
+#include <stout/linkedhashmap.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
 #include <stout/multihashmap.hpp>
@@ -121,6 +122,10 @@ public:
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
 
+  // Called when an executor re-registers with a recovering slave.
+  // 'tasks' : Unacknowledged tasks (i.e., tasks that the executor
+  //           driver never received an ACK for.)
+  // 'updates' : Unacknowledged updates.
   void reregisterExecutor(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
@@ -136,7 +141,11 @@ public:
   void ping(const UPID& from, const std::string& body);
 
   // Handles the status update.
-  void statusUpdate(const StatusUpdate& update);
+  // NOTE: If 'pid' is a valid UPID an ACK is sent to this pid
+  // after the update is successfully handled. If pid == UPID()
+  // no ACK is sent. The latter is used by the slave to send
+  // status updates it generated (e.g., TASK_LOST).
+  void statusUpdate(const StatusUpdate& update, const UPID& pid);
 
   // This is called when the status update manager finishes
   // handling the update. If the handling is successful, an
@@ -144,7 +153,7 @@ public:
   void _statusUpdate(
       const Future<Nothing>& future,
       const StatusUpdate& update,
-      const Option<UPID>& pid);
+      const UPID& pid);
 
   void statusUpdateAcknowledgement(
       const SlaveID& slaveId,
@@ -325,6 +334,9 @@ private:
 
   // Root meta directory containing checkpointed data.
   const std::string metaDir;
+
+  // Indicates the number of errors ignored in "--no-strict" recovery mode.
+  unsigned int recoveryErrors;
 };
 
 
@@ -374,13 +386,15 @@ struct Executor
 
   const bool checkpoint;
 
+  const bool commandExecutor;
+
   UPID pid;
 
   Resources resources; // Currently consumed resources.
 
-  hashmap<TaskID, TaskInfo> queuedTasks; // Not yet launched.
-  hashmap<TaskID, Task*> launchedTasks;  // Running.
-  hashmap<TaskID, Task*> terminatedTasks; // Terminated but pending updates.
+  LinkedHashMap<TaskID, TaskInfo> queuedTasks; // Not yet launched.
+  LinkedHashMap<TaskID, Task*> launchedTasks;  // Running.
+  LinkedHashMap<TaskID, Task*> terminatedTasks; // Terminated but pending updates.
   boost::circular_buffer<Task> completedTasks; // Terminated and updates acked.
 
 private:
@@ -432,6 +446,11 @@ private:
   Framework(const Framework&);              // No copying.
   Framework& operator = (const Framework&); // No assigning.
 };
+
+
+std::ostream& operator << (std::ostream& stream, Slave::State state);
+std::ostream& operator << (std::ostream& stream, Framework::State state);
+std::ostream& operator << (std::ostream& stream, Executor::State state);
 
 } // namespace slave {
 } // namespace internal {

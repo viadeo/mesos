@@ -140,10 +140,12 @@ protected:
       const std::vector<TaskInfo>& tasks,
       const Filters& filters);
 
-  // Reconciles a re-registering slave's tasks and sends TASK_LOST
-  // updates for tasks known to the master but unknown to the slave.
-  void reconcileTasks(
+  // Reconciles a re-registering slave's tasks / executors and sends
+  // TASK_LOST updates for tasks known to the master but unknown to
+  // the slave.
+  void reconcile(
       Slave* slave,
+      const std::vector<ExecutorInfo>& executors,
       const std::vector<Task>& tasks);
 
   // Add a framework.
@@ -247,6 +249,12 @@ private:
   hashmap<FrameworkID, Framework*> frameworks;
 
   hashmap<SlaveID, Slave*> slaves;
+
+  // Ideally we could use SlaveIDs to track deactivated slaves.
+  // However, we would not know when to remove the SlaveID from this
+  // set. After deactivation, the same slave machine can register with
+  // the same. Using PIDs allows us to remove the deactivated
+  // slave PID once any slave registers with the same PID!
   hashset<UPID> deactivatedSlaves;
 
   hashmap<OfferID, Offer*> offers;
@@ -383,6 +391,7 @@ struct Slave
   UPID pid;
 
   Time registeredTime;
+  Option<Time> reregisteredTime;
   Time lastHeartbeat;
 
   // We mark a slave 'disconnected' when it has checkpointing
