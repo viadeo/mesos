@@ -1,4 +1,3 @@
 usr/bin/* /usr/bin
 usr/lib/mesos/mesos-* usr/lib/mesos
-usr/lib/libmesos* usr/lib
 usr/include/mesos usr/include
