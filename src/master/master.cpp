@@ -240,8 +240,12 @@ Master::~Master()
     // Remove tasks that are in the slave but not in any framework.
     // This could happen when the framework has yet to reregister
     // after master failover.
-    foreachvalue (Task* task, utils::copy(slave->tasks)) {
-      removeTask(task);
+    // NOTE: keys() and values() are used because slave->tasks is
+    //       modified by removeTask()!
+    foreach (const FrameworkID& frameworkId, slave->tasks.keys()) {
+      foreach (Task* task, slave->tasks[frameworkId].values()) {
+        removeTask(task);
+      }
     }
 
     // Kill the slave observer.
@@ -564,20 +568,13 @@ void Master::exited(const UPID& pid)
         // Mark the slave as disconnected and remove it from the allocator.
         slave->disconnected = true;
 
-        // TODO(vinod/Thomas): Instead of removing the slave, we should
-        // have 'Allocator::slave{Reconnected, Disconnected}'.
-        allocator->slaveRemoved(slave->id);
+        allocator->slaveDisconnected(slave->id);
 
         // If a slave is checkpointing, remove all non-checkpointing
         // frameworks from the slave.
         // First, collect all the frameworks running on this slave.
-        hashset<FrameworkID> frameworkIds;
-        foreachvalue (Task* task, slave->tasks) {
-          frameworkIds.insert(task->framework_id());
-        }
-        foreachkey (const FrameworkID& frameworkId, slave->executors) {
-          frameworkIds.insert(frameworkId);
-        }
+        hashset<FrameworkID> frameworkIds =
+          slave->tasks.keys() | slave->executors.keys();
 
         // Now, remove all the non-checkpointing frameworks.
         foreach (const FrameworkID& frameworkId, frameworkIds) {
@@ -592,8 +589,6 @@ void Master::exited(const UPID& pid)
         }
 
         foreach (Offer* offer, utils::copy(slave->offers)) {
-          // TODO(vinod): We don't need to call 'Allocator::resourcesRecovered'
-          // once MESOS-621 is fixed.
           allocator->resourcesRecovered(
               offer->framework_id(), slave->id, offer->resources());
 
@@ -787,20 +782,22 @@ void Master::reregisterFramework(const FrameworkInfo& frameworkInfo,
 
     // Add any running tasks reported by slaves for this framework.
     foreachvalue (Slave* slave, slaves) {
-      foreachvalue (Task* task, slave->tasks) {
-        if (framework->id == task->framework_id()) {
-          framework->addTask(task);
-          // Also add the task's executor for resource accounting.
-          if (task->has_executor_id()) {
-            if (!framework->hasExecutor(slave->id, task->executor_id())) {
-              CHECK(slave->hasExecutor(framework->id, task->executor_id()))
-                << "Unknown executor " << task->executor_id()
-                << " of framework " << framework->id
-                << " for the task " << task->task_id();
+      foreachkey (const FrameworkID& frameworkId, slave->tasks) {
+        foreachvalue (Task* task, slave->tasks[frameworkId]) {
+          if (framework->id == task->framework_id()) {
+            framework->addTask(task);
+            // Also add the task's executor for resource accounting.
+            if (task->has_executor_id()) {
+              if (!framework->hasExecutor(slave->id, task->executor_id())) {
+                CHECK(slave->hasExecutor(framework->id, task->executor_id()))
+                  << "Unknown executor " << task->executor_id()
+                  << " of framework " << framework->id
+                  << " for the task " << task->task_id();
 
-              const ExecutorInfo& executorInfo =
-                slave->executors[framework->id][task->executor_id()];
-              framework->addExecutor(slave->id, executorInfo);
+                const ExecutorInfo& executorInfo =
+                  slave->executors[framework->id][task->executor_id()];
+                framework->addExecutor(slave->id, executorInfo);
+              }
             }
           }
         }
@@ -1117,6 +1114,7 @@ void Master::reregisterSlave(const SlaveID& slaveId,
     reply(ShutdownMessage());
   } else {
     Slave* slave = getSlave(slaveId);
+
     if (slave != NULL) {
       slave->reregisteredTime = Clock::now();
 
@@ -1131,22 +1129,13 @@ void Master::reregisterSlave(const SlaveID& slaveId,
                    << ") is being allowed to re-register with an already"
                    << " in use id (" << slaveId << ")";
 
-      // If this is a disconnected slave, add it back to the allocator.
-      if (slave->disconnected) {
-        slave->disconnected = false; // Reset the flag.
-
-        hashmap<FrameworkID, Resources> resources;
-        foreach (const ExecutorInfo& executorInfo, executorInfos) {
-          resources[executorInfo.framework_id()] += executorInfo.resources();
-        }
-        foreach (const Task& task, tasks) {
-          // Ignore tasks that have reached terminal state.
-          if (!protobuf::isTerminalState(task.state())) {
-            resources[task.framework_id()] += task.resources();
-          }
-        }
-        allocator->slaveAdded(slaveId, slaveInfo, resources);
-      }
+      // TODO(bmahler): There's an implicit assumption here that when
+      // the master already knows about this slave, the slave cannot
+      // have tasks unknown to the master. This _should_ be the case
+      // since the causal relationship is:
+      //   slave removes task -> master removes task
+      // We should enforce this via a CHECK (dangerous), or by shutting
+      // down slaves that are found to violate this assumption.
 
       SlaveReregisteredMessage message;
       message.mutable_slave_id()->MergeFrom(slave->id);
@@ -1166,6 +1155,15 @@ void Master::reregisterSlave(const SlaveID& slaveId,
       // NOTE: This needs to be done after the registration message is
       // sent to the slave and the new pid is linked.
       reconcile(slave, executorInfos, tasks);
+
+      // If this is a disconnected slave, add it back to the allocator.
+      // This is done after reconciliation to ensure the allocator's
+      // offers include the recovered resources initially on this
+      // slave.
+      if (slave->disconnected) {
+        slave->disconnected = false; // Reset the flag.
+        allocator->slaveReconnected(slaveId);
+      }
     } else {
       // NOTE: This handles the case when the slave tries to
       // re-register with a failed over master.
@@ -1859,21 +1857,25 @@ void Master::reconcile(
   // missing from the slave. This could happen if the task was
   // dropped by the slave (e.g., slave exited before getting the
   // task or the task was launched while slave was in recovery).
-  foreachvalue (Task* task, utils::copy(slave->tasks)) {
-    if (!slaveTasks.contains(task->framework_id(), task->task_id())) {
-      LOG(WARNING) << "Sending TASK_LOST for task " << task->task_id()
-                   << " of framework " << task->framework_id()
-                   << " unknown to the slave " << slave->id
-                   << " (" << slave->info.hostname() << ")";
+  // NOTE: keys() and values() are used since statusUpdate()
+  //       modifies slave->tasks.
+  foreach (const FrameworkID& frameworkId, slave->tasks.keys()) {
+    foreach (Task* task, slave->tasks[frameworkId].values()) {
+      if (!slaveTasks.contains(task->framework_id(), task->task_id())) {
+        LOG(WARNING) << "Sending TASK_LOST for task " << task->task_id()
+                     << " of framework " << task->framework_id()
+                     << " unknown to the slave " << slave->id
+                     << " (" << slave->info.hostname() << ")";
 
-      const StatusUpdate& update = protobuf::createStatusUpdate(
-          task->framework_id(),
-          slave->id,
-          task->task_id(),
-          TASK_LOST,
-          "Task is unknown to the slave");
+        const StatusUpdate& update = protobuf::createStatusUpdate(
+            task->framework_id(),
+            slave->id,
+            task->task_id(),
+            TASK_LOST,
+            "Task is unknown to the slave");
 
-      statusUpdate(update, UPID());
+        statusUpdate(update, UPID());
+      }
     }
   }
 
@@ -2121,8 +2123,11 @@ void Master::removeFramework(Slave* slave, Framework* framework)
             << " from slave " << slave->id
             << " (" << slave->info.hostname() << ")";
 
-  // Remove pointers to framework's tasks in slaves, and send status updates.
-  foreachvalue (Task* task, utils::copy(slave->tasks)) {
+  // Remove pointers to framework's tasks in slaves, and send status
+  // updates.
+  // NOTE: values() is used because statusUpdate() modifies
+  //       slave->tasks.
+  foreach (Task* task, slave->tasks[framework->id].values()) {
     // Remove tasks that belong to this framework.
     if (task->framework_id() == framework->id) {
       // A framework might not actually exist because the master failed
@@ -2284,26 +2289,31 @@ void Master::removeSlave(Slave* slave)
     allocator->slaveRemoved(slave->id);
   }
 
-  // Remove pointers to slave's tasks in frameworks, and send status updates
-  foreachvalue (Task* task, utils::copy(slave->tasks)) {
-    // A framework might not actually exist because the master failed
-    // over and the framework hasn't reconnected. This can be a tricky
-    // situation for frameworks that want to have high-availability,
-    // because if they eventually do connect they won't ever get a
-    // status update about this task.  Perhaps in the future what we
-    // want to do is create a local Framework object to represent that
-    // framework until it fails over. See the TODO above in
-    // Master::reregisterSlave.
-    const StatusUpdate& update = protobuf::createStatusUpdate(
-        task->framework_id(),
-        task->slave_id(),
-        task->task_id(),
-        TASK_LOST,
-        "Slave " + slave->info.hostname() + " removed",
-        (task->has_executor_id() ?
-            Option<ExecutorID>(task->executor_id()) : None()));
+  // Remove pointers to slave's tasks in frameworks, and send status
+  // updates.
+  // NOTE: keys() and values() are used because statusUpdate()
+  //       modifies slave->tasks.
+  foreach (const FrameworkID& frameworkId, slave->tasks.keys()) {
+    foreach (Task* task, slave->tasks[frameworkId].values()) {
+      // A framework might not actually exist because the master failed
+      // over and the framework hasn't reconnected. This can be a tricky
+      // situation for frameworks that want to have high-availability,
+      // because if they eventually do connect they won't ever get a
+      // status update about this task.  Perhaps in the future what we
+      // want to do is create a local Framework object to represent that
+      // framework until it fails over. See the TODO above in
+      // Master::reregisterSlave.
+      const StatusUpdate& update = protobuf::createStatusUpdate(
+          task->framework_id(),
+          task->slave_id(),
+          task->task_id(),
+          TASK_LOST,
+          "Slave " + slave->info.hostname() + " removed",
+          (task->has_executor_id() ?
+              Option<ExecutorID>(task->executor_id()) : None()));
 
-    statusUpdate(update, UPID());
+      statusUpdate(update, UPID());
+    }
   }
 
   foreach (Offer* offer, utils::copy(slave->offers)) {
@@ -2321,6 +2331,13 @@ void Master::removeSlave(Slave* slave)
     Framework* framework = getFramework(frameworkId);
     if (framework != NULL) {
       foreachkey (const ExecutorID& executorId, slave->executors[frameworkId]) {
+        // TODO(vinod): We don't need to call 'Allocator::resourcesRecovered'
+        // once MESOS-621 is fixed.
+        allocator->resourcesRecovered(
+            frameworkId,
+            slave->id,
+            slave->executors[frameworkId][executorId].resources());
+
         framework->removeExecutor(slave->id, executorId);
       }
     }

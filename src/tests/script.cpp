@@ -19,10 +19,12 @@
 #include <signal.h> // For strsignal.
 #include <stdio.h>  // For freopen.
 #include <string.h> // For strlen, strerror.
+#include <unistd.h> // For sysconf.
 
 #include <sys/wait.h> // For wait (and associated macros).
 
 #include <string>
+#include <vector>
 
 #include <stout/check.hpp>
 #include <stout/os.hpp>
@@ -34,13 +36,19 @@
 #include "tests/script.hpp"
 
 using std::string;
+using std::vector;
 
 namespace mesos {
 namespace internal {
 namespace tests {
 
-void execute(const string& script)
+void execute(const string& script, const vector<string>& arguments)
 {
+  static long maximumArguments = sysconf(_SC_ARG_MAX);
+  PCHECK(maximumArguments != -1);
+
+  CHECK_LT(arguments.size(), static_cast<size_t>(maximumArguments));
+
   // Create a temporary directory for the test.
   Try<string> directory = environment->mkdtemp();
 
@@ -104,8 +112,17 @@ void execute(const string& script)
     os::setenv("MESOS_WEBUI_DIR", path::join(flags.source_dir, "src", "webui"));
     os::setenv("MESOS_LAUNCHER_DIR", path::join(flags.build_dir, "src"));
 
+    // Construct the argument array.
+    const char** args = (const char**) new char*[arguments.size() + 1];
+    args[0] = path.get().c_str();
+    size_t index = 1;
+    foreach (const string& argument, arguments) {
+      args[index++] = argument.c_str();
+    }
+    args[arguments.size() + 1] = NULL;
+
     // Now execute the script.
-    execl(path.get().c_str(), path.get().c_str(), (char*) NULL);
+    execv(path.get().c_str(), (char* const*) args);
 
     std::cerr << "Failed to execute '" << script << "': "
               << strerror(errno) << std::endl;
