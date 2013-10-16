@@ -38,6 +38,7 @@
 #include <stout/hashset.hpp>
 #include <stout/multihashmap.hpp>
 #include <stout/option.hpp>
+#include <stout/owned.hpp>
 
 #include "common/type_utils.hpp"
 #include "common/units.hpp"
@@ -52,6 +53,13 @@
 
 namespace mesos {
 namespace internal {
+
+namespace sasl {
+
+class Authenticator; // Forward declaration.
+
+}
+
 namespace master {
 
 using namespace process; // Included to make code easier to read.
@@ -59,7 +67,7 @@ using namespace process; // Included to make code easier to read.
 // Forward declarations.
 namespace allocator {
 
-  class Allocator;
+class Allocator;
 
 }
 
@@ -114,16 +122,44 @@ public:
                       const ExecutorID& executorId,
                       int32_t status);
   void deactivateSlave(const SlaveID& slaveId);
+
+  // TODO(bmahler): It would be preferred to use a unique libprocess
+  // Process identifier (PID is not sufficient) for identifying the
+  // framework instance, rather than relying on re-registration time.
   void frameworkFailoverTimeout(const FrameworkID& frameworkId,
                                 const Time& reregisteredTime);
 
   void offer(const FrameworkID& framework,
              const hashmap<SlaveID, Resources>& resources);
 
+  void reconcileTasks(
+      const FrameworkID& frameworkId,
+      const std::vector<TaskStatus>& statuses);
+
+  void authenticate(const UPID& pid);
+
 protected:
   virtual void initialize();
   virtual void finalize();
   virtual void exited(const UPID& pid);
+
+  void _registerFramework(const FrameworkInfo& frameworkInfo, const UPID& pid);
+
+  void _reregisterFramework(
+      const FrameworkInfo& frameworkInfo,
+      bool failover,
+      const UPID& pid);
+
+  void deactivate(Framework* framework);
+
+  // 'promise' is used to signal finish of authentication.
+  // 'future' is the future returned by the authenticator.
+  void _authenticate(
+      const UPID& pid,
+      const Owned<Promise<Nothing> >& promise,
+      const Future<bool>& future);
+
+  void authenticationTimeout(Future<bool> future);
 
   void fileAttached(const Future<Nothing>& result, const std::string& path);
 
@@ -260,6 +296,16 @@ private:
   hashmap<OfferID, Offer*> offers;
 
   hashmap<std::string, Role*> roles;
+
+  // Frameworks that are currently in the process of authentication.
+  // 'authenticating' future for a framework is ready when it is
+  // authenticated.
+  hashmap<UPID, Future<Nothing> > authenticating;
+
+  hashmap<UPID, Owned<sasl::Authenticator> > authenticators;
+
+  // Authenticated frameworks keyed by framework's PID.
+  hashset<UPID> authenticated;
 
   boost::circular_buffer<std::tr1::shared_ptr<Framework> > completedFrameworks;
 

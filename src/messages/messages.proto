@@ -206,6 +206,12 @@ message LostSlaveMessage {
 }
 
 
+message ReconcileTasksMessage {
+  required FrameworkID framework_id = 1;
+  repeated TaskStatus statuses = 2;
+}
+
+
 message FrameworkErrorMessage {
   required string message = 2;
 }
@@ -337,7 +343,9 @@ message NewMasterDetectedMessage {
 }
 
 
-message AuthenticateMessage {}
+message AuthenticateMessage {
+  required string pid = 1; // PID that needs to be authenticated.
+}
 
 
 message AuthenticationMechanismsMessage {
