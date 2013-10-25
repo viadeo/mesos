@@ -21,7 +21,6 @@
 
 #include <string>
 
-#include <stout/bytes.hpp>
 #include <stout/duration.hpp>
 #include <stout/flags.hpp>
 #include <stout/option.hpp>
@@ -39,6 +38,11 @@ class Flags : public logging::Flags
 public:
   Flags()
   {
+    add(&Flags::hostname,
+        "hostname",
+        "The hostname the slave should report.\n"
+        "If left unset, system hostname will be used (recommended).");
+
     // TODO(benh): Is there a way to specify units for the resources?
     add(&Flags::resources,
         "resources",
@@ -128,7 +132,7 @@ public:
         "to disk. This enables a restarted slave to recover\n"
         "status updates and reconnect with (--recover=reconnect) or\n"
         "kill (--recover=kill) old executors",
-        false);
+        true);
 
     add(&Flags::recover,
         "recover",
@@ -180,19 +184,10 @@ public:
         "Cgroups feature flag to enable hard limits on CPU resources\n"
         "via the CFS bandwidth limiting subfeature.\n",
         false);
-
-    add(&Flags::cgroups_oom_buffer,
-        "cgroups_oom_buffer",
-        "Additional memory alloted to executors in order to allow mesos\n"
-        "to soft-kill the executor prior to the kernel placing it under OOM.\n"
-        "(e.g. 128MB)\n"
-        "NOTE: This was added to compensate for a bug in the Linux kernel\n"
-        "      that causes the system to lock up when the oom_killer is\n"
-        "      disabled.",
-        Megabytes(128));
 #endif
   }
 
+  Option<std::string> hostname;
   Option<std::string> resources;
   std::string default_role;
   Option<std::string> attributes;
@@ -215,7 +210,6 @@ public:
   std::string cgroups_root;
   std::string cgroups_subsystems;
   bool cgroups_enable_cfs;
-  Bytes cgroups_oom_buffer;
 #endif
 };
 

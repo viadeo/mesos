@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include <process/async.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
@@ -211,28 +212,24 @@ void Slave::initialize()
     attributes = Attributes::parse(flags.attributes.get());
   }
 
-  // Determine our hostname.
-  Try<string> result = os::hostname();
+  // Determine our hostname or use the hostname provided.
+  string hostname;
 
-  if (result.isError()) {
-    LOG(FATAL) << "Failed to get hostname: " << result.error();
-  }
+  if (flags.hostname.isNone()) {
+    Try<string> result = os::hostname();
 
-  string hostname = result.get();
+    if (result.isError()) {
+      LOG(FATAL) << "Failed to get hostname: " << result.error();
+    }
 
-  // Check and see if we have a different public DNS name. Normally
-  // this is our hostname, but on EC2 we look for the MESOS_PUBLIC_DNS
-  // environment variable. This allows the master to display our
-  // public name in its webui.
-  string webui_hostname = hostname;
-  if (getenv("MESOS_PUBLIC_DNS") != NULL) {
-    webui_hostname = getenv("MESOS_PUBLIC_DNS");
+    hostname = result.get();
+  } else {
+    hostname = flags.hostname.get();
   }
 
   // Initialize slave info.
   info.set_hostname(hostname);
   info.set_port(self().port);
-  info.set_webui_hostname(webui_hostname); // Deprecated!
   info.mutable_resources()->MergeFrom(resources);
   info.mutable_attributes()->MergeFrom(attributes);
   info.set_checkpoint(flags.checkpoint);
@@ -378,74 +375,11 @@ void Slave::initialize()
             << ". Please run the slave with '--help' to see the valid options";
   }
 
-  // Start recovery.
-  recover(flags.recover == "reconnect", flags.strict)
-    .onAny(defer(self(), &Slave::_initialize, lambda::_1));
-}
-
-
-void Slave::_initialize(const Future<Nothing>& future)
-{
-  if (!future.isReady()) {
-    EXIT(1)
-      << "Failed to perform recovery: "
-      << (future.isFailed() ? future.failure() : "future discarded") << "\n"
-      << "To remedy this do as follows:\n"
-      << "Step 1: rm -f " << paths::getLatestSlavePath(metaDir) << "\n"
-      << "        This ensures slave doesn't recover old live executors.\n"
-      << "Step 2: Restart the slave.";
-  }
-
-  LOG(INFO) << "Finished recovery";
-
-  // Schedule all old slave directories for garbage collection.
-  // TODO(vinod): Do this as part of recovery. This needs a fix
-  // in the recovery code, to recover all slaves instead of only
-  // the latest slave.
-  const string& directory = path::join(flags.work_dir, "slaves");
-  foreach (const string& entry, os::ls(directory)) {
-    const string& path = path::join(directory, entry);
-    // Ignore non-directory entries.
-    if (!os::isdir(path)) {
-      continue;
-    }
-
-    // We garbage collect a directory if either the slave has not
-    // recovered its id (hence going to get a new id when it
-    // registers with the master) or if it is an old work directory.
-    SlaveID slaveId;
-    slaveId.set_value(entry);
-    if (!info.has_id() || !(slaveId == info.id())) {
-      LOG(INFO) << "Garbage collecting old slave " << slaveId;
-
-      // GC the slave work directory.
-      gc.schedule(flags.gc_delay, path);
-
-      if (os::exists(paths::getSlavePath(metaDir, slaveId))) {
-        // GC the slave meta directory.
-        gc.schedule(flags.gc_delay, paths::getSlavePath(metaDir, slaveId));
-      }
-    }
-  }
-
-  recovered.set(Nothing()); // Signal recovery.
-
-  // Terminate slave, if it has no active frameworks and is started
-  // in 'cleanup' mode.
-  if (frameworks.empty() && flags.recover == "cleanup") {
-    terminate(self());
-  } else if (flags.recover == "reconnect") {
-    // Re-register if reconnecting.
-    // NOTE: Since the slave in cleanup mode never re-registers, if
-    // the master fails over it will not forward the updates from
-    // the "unknown" slave to the scheduler. This could lead to the
-    // slave waiting indefinitely for acknowledgements. The master's
-    // registrar could help in handling this correctly.
-    state = DISCONNECTED;
-    if (master) {
-      doReliableRegistration();
-    }
-  }
+  // Do recovery.
+  async(&state::recover, metaDir, flags.strict)
+    .then(defer(self(), &Slave::recover, lambda::_1))
+    .then(defer(self(), &Slave::_recover))
+    .onAny(defer(self(), &Slave::__recover, lambda::_1));
 }
 
 
@@ -468,7 +402,7 @@ void Slave::finalize()
     // checkpointing. This is because slave recovery tests terminate
     // the slave to simulate slave restart.
     if (!frameworks[frameworkId]->info.checkpoint()) {
-      shutdownFramework(frameworkId);
+      shutdownFramework(UPID(), frameworkId);
     }
   }
 
@@ -487,7 +421,7 @@ void Slave::finalize()
 }
 
 
-void Slave::shutdown()
+void Slave::shutdown(const UPID& from)
 {
   // Allow shutdown message only if
   // 1) Its a message received from the registered master or
@@ -517,7 +451,7 @@ void Slave::shutdown()
     // NOTE: We use 'frameworks.keys()' here because 'shutdownFramework'
     // can potentially remove a framework from 'frameworks'.
     foreach (const FrameworkID& frameworkId, frameworks.keys()) {
-      shutdownFramework(frameworkId);
+      shutdownFramework(from, frameworkId);
     }
   }
 }
@@ -600,7 +534,7 @@ void Slave::noMasterDetected()
 }
 
 
-void Slave::registered(const SlaveID& slaveId)
+void Slave::registered(const UPID& from, const SlaveID& slaveId)
 {
   if (from != master) {
     LOG(WARNING) << "Ignoring registration message from " << from
@@ -647,7 +581,7 @@ void Slave::registered(const SlaveID& slaveId)
 }
 
 
-void Slave::reregistered(const SlaveID& slaveId)
+void Slave::reregistered(const UPID& from, const SlaveID& slaveId)
 {
   if (from != master) {
     LOG(WARNING) << "Ignoring re-registration message from " << from
@@ -919,7 +853,6 @@ void Slave::_runTask(
     return;
   }
 
-
   if (!future.isReady()) {
     LOG(ERROR) << "Failed to unschedule directories scheduled for gc: "
                << (future.isFailed() ? future.failure() : "future discarded");
@@ -1169,7 +1102,9 @@ void Slave::killTask(const FrameworkID& frameworkId, const TaskID& taskId)
 // sending back a shut down acknowledgement, because otherwise you
 // could get into a state where a shut down was sent, dropped, and
 // therefore never processed.
-void Slave::shutdownFramework(const FrameworkID& frameworkId)
+void Slave::shutdownFramework(
+    const UPID& from,
+    const FrameworkID& frameworkId)
 {
   // Allow shutdownFramework() only if
   // its called directly (e.g. Slave::finalize()) or
@@ -1211,9 +1146,6 @@ void Slave::shutdownFramework(const FrameworkID& frameworkId)
       framework->state = Framework::TERMINATING;
 
       // Shut down all executors of this framework.
-      // NOTE: If there are no executors but 'pending' tasks, the
-      // framework will be removed and all its tasks are appropriately
-      // handled in '_runTask()'.
       // NOTE: We use 'executors.keys()' here because 'shutdownExecutor'
       // and 'removeExecutor' can remove an executor from 'executors'.
       foreach (const ExecutorID& executorId, framework->executors.keys()) {
@@ -1235,6 +1167,11 @@ void Slave::shutdownFramework(const FrameworkID& frameworkId)
         } else {
           // Executor is terminating. Ignore.
         }
+      }
+
+      // Remove this framework if it has no pending executors and tasks.
+      if (framework->executors.empty() && framework->pending.empty()) {
+        removeFramework(framework);
       }
       break;
     default:
@@ -1450,10 +1387,16 @@ void Slave::_statusUpdateAcknowledgement(
   if (executor->state == Executor::TERMINATED && !executor->incompleteTasks()) {
     removeExecutor(framework, executor);
   }
+
+  // Remove this framework if it has no pending executors and tasks.
+  if (framework->executors.empty() && framework->pending.empty()) {
+    removeFramework(framework);
+  }
 }
 
 
 void Slave::registerExecutor(
+    const UPID& from,
     const FrameworkID& frameworkId,
     const ExecutorID& executorId)
 {
@@ -1605,6 +1548,7 @@ void Slave::registerExecutor(
 
 
 void Slave::reregisterExecutor(
+    const UPID& from,
     const FrameworkID& frameworkId,
     const ExecutorID& executorId,
     const vector<TaskInfo>& tasks,
@@ -2286,6 +2230,11 @@ void Slave::executorTerminated(
           !executor->incompleteTasks()) {
         removeExecutor(framework, executor);
       }
+
+      // Remove this framework if it has no pending executors and tasks.
+      if (framework->executors.empty() && framework->pending.empty()) {
+        removeFramework(framework);
+      }
       break;
     }
     default:
@@ -2332,7 +2281,8 @@ void Slave::removeExecutor(Framework* framework, Executor* executor)
   const string& path = paths::getExecutorRunPath(
       flags.work_dir, info.id(), framework->id, executor->id, executor->uuid);
 
-  gc.schedule(flags.gc_delay, path)
+  os::utime(path); // Update the modification time.
+  garbageCollect(path)
     .then(defer(self(), &Self::detachFile, path));
 
   // Schedule the top level executor work directory, only if the
@@ -2341,7 +2291,8 @@ void Slave::removeExecutor(Framework* framework, Executor* executor)
     const string& path = paths::getExecutorPath(
         flags.work_dir, info.id(), framework->id, executor->id);
 
-    gc.schedule(flags.gc_delay, path);
+    os::utime(path); // Update the modification time.
+    garbageCollect(path);
   }
 
   if (executor->checkpoint) {
@@ -2349,7 +2300,8 @@ void Slave::removeExecutor(Framework* framework, Executor* executor)
     const string& path = paths::getExecutorRunPath(
         metaDir, info.id(), framework->id, executor->id, executor->uuid);
 
-    gc.schedule(flags.gc_delay, path);
+    os::utime(path); // Update the modification time.
+    garbageCollect(path);
 
     // Schedule the top level executor meta directory, only if the
     // framework doesn't have any 'pending' tasks for this executor.
@@ -2357,16 +2309,12 @@ void Slave::removeExecutor(Framework* framework, Executor* executor)
       const string& path = paths::getExecutorPath(
           metaDir, info.id(), framework->id, executor->id);
 
-      gc.schedule(flags.gc_delay, path);
+      os::utime(path); // Update the modification time.
+      garbageCollect(path);
     }
   }
 
   framework->destroyExecutor(executor->id);
-
-  // Remove this framework if it has no pending executors and tasks.
-  if (framework->executors.empty() && framework->pending.empty()) {
-    removeFramework(framework);
-  }
 }
 
 
@@ -2395,14 +2343,16 @@ void Slave::removeFramework(Framework* framework)
   const string& path = paths::getFrameworkPath(
       flags.work_dir, info.id(), framework->id);
 
-  gc.schedule(flags.gc_delay, path);
+  os::utime(path); // Update the modification time.
+  garbageCollect(path);
 
   if (framework->info.checkpoint()) {
     // Schedule the framework meta directory to get garbage collected.
     const string& path = paths::getFrameworkPath(
         metaDir, info.id(), framework->id);
 
-    gc.schedule(flags.gc_delay, path);
+    os::utime(path); // Update the modification time.
+    garbageCollect(path);
   }
 
   frameworks.erase(framework->id);
@@ -2639,78 +2589,68 @@ void Slave::_checkDiskUsage(const Future<Try<double> >& usage)
 }
 
 
-Future<Nothing> Slave::recover(bool reconnect, bool strict)
-{
-  // We consider the absence of 'metaDir' to mean that this is either
-  // the first time this slave was started with checkpointing enabled
-  // or this slave was started after an upgrade (--recover=cleanup).
-  if (!os::exists(metaDir)) {
-    // NOTE: We recover the isolator here to cleanup any old
-    // executors (e.g: orphaned cgroups).
-    return dispatch(isolator, &Isolator::recover, None());
-  }
 
-  // First, recover the slave state.
-  Result<SlaveState> state = state::recover(metaDir, strict);
-  if (state.isError()) {
+Future<Nothing> Slave::recover(const Result<SlaveState>& _state)
+{
+  if (_state.isError()) {
     EXIT(1)
-      << "Failed to recover slave state: " << state.error() << "\n"
+      << "Failed to recover slave state: " << _state.error() << "\n"
       << "To remedy this try the following:\n"
       << (flags.strict
           ? "Restart the slave with '--no-strict' flag (partial recovery)"
           : "rm '" + paths::getLatestSlavePath(metaDir) + "' (no recovery)");
   }
 
-  if (state.isNone() || state.get().info.isNone()) {
-    // We are here if the slave died before checkpointing its info.
-    // NOTE: We recover the isolator here to cleanup any old
-    // executors (e.g: orphaned cgroups).
-    return dispatch(isolator, &Isolator::recover, None());
+  // Convert Result<SlaveState> to Option<SlaveState> for convenience.
+  Option<SlaveState> state;
+  if (_state.isSome()) {
+    state = _state.get();
   }
 
-  // Check for SlaveInfo compatibility.
-  // TODO(vinod): Also check for version compatibility.
-  // NOTE: We set the 'id' field in 'info' from the recovered state,
-  // as a hack to compare the info created from options/flags with
-  // the recovered info.
-  info.mutable_id()->CopyFrom(state.get().id);
-  if (reconnect && !(info == state.get().info.get())) {
-    EXIT(1)
-      << "Incompatible slave info detected.\n"
-      << "------------------------------------------------------------\n"
-      << "Old slave info:\n" << state.get().info.get() << "\n"
-      << "------------------------------------------------------------\n"
-      << "New slave info:\n" << info << "\n"
-      << "------------------------------------------------------------\n"
-      << "To properly upgrade the slave do as follows:\n"
-      << "Step 1: Start the slave with --recover=cleanup.\n"
-      << "Step 2: Wait till the slave kills all executors and shuts down.\n"
-      << "Step 3: Start the upgraded slave with --recover=reconnect.\n";
+  if (state.isSome() && state.get().info.isSome()) {
+    // Check for SlaveInfo compatibility.
+    // TODO(vinod): Also check for version compatibility.
+    // NOTE: We set the 'id' field in 'info' from the recovered state,
+    // as a hack to compare the info created from options/flags with
+    // the recovered info.
+    info.mutable_id()->CopyFrom(state.get().id);
+    if (flags.recover == "reconnect" && !(info == state.get().info.get())) {
+      EXIT(1)
+        << "Incompatible slave info detected.\n"
+        << "------------------------------------------------------------\n"
+        << "Old slave info:\n" << state.get().info.get() << "\n"
+        << "------------------------------------------------------------\n"
+        << "New slave info:\n" << info << "\n"
+        << "------------------------------------------------------------\n"
+        << "To properly upgrade the slave do as follows:\n"
+        << "Step 1: Start the slave with --recover=cleanup.\n"
+        << "Step 2: Wait till the slave kills all executors and shuts down.\n"
+        << "Step 3: Start the upgraded slave with --recover=reconnect.\n";
+    }
+
+    info = state.get().info.get(); // Recover the slave info.
+
+    recoveryErrors = state.get().errors;
+    if (recoveryErrors > 0) {
+      LOG(WARNING) << "Errors encountered during recovery: " << recoveryErrors;
+    }
+
+    // Recover the frameworks.
+    foreachvalue (const FrameworkState& frameworkState,
+                  state.get().frameworks) {
+      recoverFramework(frameworkState);
+    }
   }
 
-  info = state.get().info.get(); // Recover the slave info.
-
-  recoveryErrors = state.get().errors;
-  if (recoveryErrors > 0) {
-    LOG(WARNING) << "Errors encountered during recovery: " << recoveryErrors;
-  }
-
-  // First, recover the frameworks and executors.
-  foreachvalue (const FrameworkState& frameworkState, state.get().frameworks) {
-    recoverFramework(frameworkState);
-  }
-
-  // Now recover the status update manager and then the isolator.
-  return statusUpdateManager->recover(metaDir, state.get())
-           .then(defer(isolator, &Isolator::recover, state.get()))
-           .then(defer(self(), &Self::_recover, state.get(), reconnect));
+  return statusUpdateManager->recover(metaDir, state)
+    .then(defer(isolator, &Isolator::recover, state));
 }
 
 
-Future<Nothing> Slave::_recover(const SlaveState& state, bool reconnect)
+Future<Nothing> Slave::_recover()
 {
-  foreachvalue(Framework* framework, frameworks){
-    foreachvalue(Executor* executor, framework->executors) {
+  foreachvalue (Framework* framework, frameworks) {
+    foreachvalue (Executor* executor, framework->executors) {
       // If the executor is already terminating/terminated don't
       // bother reconnecting or killing it. This could happen if
       // the recovered isolator sent a 'ExecutorTerminated' message
@@ -2728,7 +2668,7 @@ Future<Nothing> Slave::_recover(const SlaveState& state, bool reconnect)
           flags.resource_monitoring_interval)
         .onAny(lambda::bind(_watch, lambda::_1, framework->id, executor->id));
 
-      if (reconnect) {
+      if (flags.recover == "reconnect") {
         if (executor->pid) {
           LOG(INFO) << "Sending reconnect request to executor " << executor->id
                     << " of framework " << framework->id
@@ -2762,7 +2702,7 @@ Future<Nothing> Slave::_recover(const SlaveState& state, bool reconnect)
     }
   }
 
-  if (reconnect) {
+  if (!frameworks.empty() && flags.recover == "reconnect") {
     // Cleanup unregistered executors after a delay.
     delay(EXECUTOR_REREGISTER_TIMEOUT,
           self(),
@@ -2778,18 +2718,91 @@ Future<Nothing> Slave::_recover(const SlaveState& state, bool reconnect)
 }
 
 
+void Slave::__recover(const Future<Nothing>& future)
+{
+  if (!future.isReady()) {
+    EXIT(1)
+      << "Failed to perform recovery: "
+      << (future.isFailed() ? future.failure() : "future discarded") << "\n"
+      << "To remedy this do as follows:\n"
+      << "Step 1: rm -f " << paths::getLatestSlavePath(metaDir) << "\n"
+      << "        This ensures slave doesn't recover old live executors.\n"
+      << "Step 2: Restart the slave.";
+  }
+
+  LOG(INFO) << "Finished recovery";
+
+  // Schedule all old slave directories for garbage collection.
+  // TODO(vinod): Do this as part of recovery. This needs a fix
+  // in the recovery code, to recover all slaves instead of only
+  // the latest slave.
+  const string& directory = path::join(flags.work_dir, "slaves");
+  foreach (const string& entry, os::ls(directory)) {
+    string path = path::join(directory, entry);
+    // Ignore non-directory entries.
+    if (!os::isdir(path)) {
+      continue;
+    }
+
+    // We garbage collect a directory if either the slave has not
+    // recovered its id (hence going to get a new id when it
+    // registers with the master) or if it is an old work directory.
+    SlaveID slaveId;
+    slaveId.set_value(entry);
+    if (!info.has_id() || !(slaveId == info.id())) {
+      LOG(INFO) << "Garbage collecting old slave " << slaveId;
+
+      // NOTE: We update the modification time of the slave work/meta
+      // directories even though these are old because these
+      // directories might not have been scheduled for gc before.
+
+      // GC the slave work directory.
+      os::utime(path); // Update the modification time.
+      garbageCollect(path);
+
+      // GC the slave meta directory.
+      path = paths::getSlavePath(metaDir, slaveId);
+      if (os::exists(path)) {
+        os::utime(path); // Update the modification time.
+        garbageCollect(path);
+      }
+    }
+  }
+
+  recovered.set(Nothing()); // Signal recovery.
+
+  // Terminate slave, if it has no active frameworks and is started
+  // in 'cleanup' mode.
+  if (frameworks.empty() && flags.recover == "cleanup") {
+    terminate(self());
+  } else if (flags.recover == "reconnect") {
+    // Re-register if reconnecting.
+    // NOTE: Since the slave in cleanup mode never re-registers, if
+    // the master fails over it will not forward the updates from
+    // the "unknown" slave to the scheduler. This could lead to the
+    // slave waiting indefinitely for acknowledgements. The master's
+    // registrar could help in handling this correctly.
+    state = DISCONNECTED;
+    if (master) {
+      doReliableRegistration();
+    }
+  }
+}
+
+
 void Slave::recoverFramework(const FrameworkState& state)
 {
   LOG(INFO) << "Recovering framework " << state.id;
 
   if (state.executors.empty()) {
     // GC the framework work directory.
-    gc.schedule(flags.gc_delay,
-                paths::getFrameworkPath(flags.work_dir, info.id(), state.id));
+    garbageCollect(
+        paths::getFrameworkPath(flags.work_dir, info.id(), state.id));
 
     // GC the framework meta directory.
-    gc.schedule(flags.gc_delay,
-                paths::getFrameworkPath(metaDir, info.id(), state.id));
+    garbageCollect(
+        paths::getFrameworkPath(metaDir, info.id(), state.id));
+
     return;
   }
 
@@ -2814,6 +2827,11 @@ void Slave::recoverFramework(const FrameworkState& state)
                    &Self::fileAttached,
                    lambda::_1,
                    executor->directory));
+
+    // Remove the executor if it's terminated.
+    if (executor->state == Executor::TERMINATED) {
+      removeExecutor(framework, executor);
+    }
   }
 
   // Remove the framework in case we didn't recover any executors.
@@ -2822,6 +2840,22 @@ void Slave::recoverFramework(const FrameworkState& state)
   }
 }
 
+
+Future<Nothing> Slave::garbageCollect(const string& path)
+{
+  Try<long> mtime = os::mtime(path);
+  if (mtime.isError()) {
+    LOG(ERROR) << "Failed to find the mtime of '" << path
+               << "': " << mtime.error();
+    return Future<Nothing>::failed(mtime.error());
+  }
+
+  // GC based on the modification time.
+  Duration delay =
+    flags.gc_delay - (Clock::now().duration() - Seconds(mtime.get()));
+
+  return gc.schedule(delay, path);
+}
 
 
 Framework::Framework(
@@ -2967,11 +3001,11 @@ Executor* Framework::recoverExecutor(const ExecutorState& state)
                  << " because its latest run cannot be recovered";
 
     // GC the top level executor work directory.
-    slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorPath(
+    slave->garbageCollect(paths::getExecutorPath(
         slave->flags.work_dir, slave->info.id(), id, state.id));
 
     // GC the top level executor meta directory.
-    slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorPath(
+    slave->garbageCollect(paths::getExecutorPath(
         slave->metaDir, slave->info.id(), id, state.id));
 
     return NULL;
@@ -2979,21 +3013,23 @@ Executor* Framework::recoverExecutor(const ExecutorState& state)
 
   // We are only interested in the latest run of the executor!
   // So, we GC all the old runs.
+  // NOTE: We don't schedule the top level executor work and meta
+  // directories for GC here, because they will be scheduled when
+  // the latest executor run terminates.
   const UUID& uuid = state.latest.get();
   foreachvalue (const RunState& run, state.runs) {
     CHECK_SOME(run.id);
-    if (uuid != run.id.get()) {
+    const UUID& runId = run.id.get();
+    if (uuid != runId) {
       // GC the executor run's work directory.
-      slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorRunPath(
-          slave->flags.work_dir, slave->info.id(), id, state.id, run.id.get()));
+      // TODO(vinod): Expose this directory to webui by recovering the
+      // tasks and doing a 'files->attach()'.
+      slave->garbageCollect(paths::getExecutorRunPath(
+          slave->flags.work_dir, slave->info.id(), id, state.id, runId));
 
       // GC the executor run's meta directory.
-      slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorRunPath(
-          slave->metaDir, slave->info.id(), id, state.id, run.id.get()));
-
-      // NOTE: We don't schedule the top level executor work and meta
-      // directories for GC here, because they will be scheduled when
-      // the latest executor run terminates.
+      slave->garbageCollect(paths::getExecutorRunPath(
+          slave->metaDir, slave->info.id(), id, state.id, runId));
     }
   }
 
@@ -3002,33 +3038,6 @@ Executor* Framework::recoverExecutor(const ExecutorState& state)
     << " of framework " << id;
 
   const RunState& run = state.runs.get(uuid).get();
-
-  // If the latest run of the executor was completed (i.e., terminated
-  // and all updates are acknowledged) in the previous run, we don't
-  // recover it.
-  if (run.completed) {
-    VLOG(1) << "Skipping recovery of executor " << state.id
-            << " of framework " << id
-            << " because its latest run " << uuid << " is completed";
-
-    // GC the executor run's work directory.
-    slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorRunPath(
-        slave->flags.work_dir, slave->info.id(), id, state.id, run.id.get()));
-
-    // GC the executor run's meta directory.
-    slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorRunPath(
-        slave->metaDir, slave->info.id(), id, state.id, run.id.get()));
-
-    // GC the top level executor work directory.
-    slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorPath(
-        slave->flags.work_dir, slave->info.id(), id, state.id));
-
-    // GC the top level executor meta directory.
-    slave->gc.schedule(slave->flags.gc_delay, paths::getExecutorPath(
-        slave->metaDir, slave->info.id(), id, state.id));
-
-    return NULL;
-  }
 
   // Create executor.
   const string& directory = paths::getExecutorRunPath(
@@ -3049,6 +3058,13 @@ Executor* Framework::recoverExecutor(const ExecutorState& state)
       << " of framework " << id;
 
     executor->pid = run.libprocessPid.get();
+  }
+
+  // If the latest run of the executor was completed (i.e., terminated
+  // and all updates are acknowledged) in the previous run, we
+  // transition its state to 'TERMINATED'.
+  if (run.completed) {
+    executor->state = Executor::TERMINATED;
   }
 
   // And finally recover all the executor's tasks.
