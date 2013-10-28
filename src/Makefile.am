@@ -52,6 +52,7 @@ noinst_LTLIBRARIES =
 sbin_PROGRAMS =
 bin_PROGRAMS =
 pkglibexec_PROGRAMS =
+dist_bin_SCRIPTS =
 dist_pkglibexec_SCRIPTS =
 nobase_dist_pkgdata_DATA =
 nodist_sbin_SCRIPTS =
@@ -215,6 +216,7 @@ libmesos_no_3rdparty_la_SOURCES += common/attributes.hpp		\
 	common/lock.hpp							\
 	common/type_utils.hpp common/thread.hpp common/units.hpp	\
 	detector/detector.hpp examples/utils.hpp files/files.hpp	\
+	hdfs/hdfs.hpp							\
 	launcher/launcher.hpp linux/cgroups.hpp				\
 	linux/fs.hpp local/flags.hpp local/local.hpp			\
 	logging/flags.hpp logging/logging.hpp				\
@@ -356,10 +358,24 @@ mesos_log_SOURCES = log/main.cpp
 mesos_log_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_log_LDADD = libmesos.la
 
-bin_PROGRAMS += mesos-mesos
-mesos_mesos_SOURCES = mesos/main.cpp
-mesos_mesos_CPPFLAGS = $(MESOS_CPPFLAGS)
-mesos_mesos_LDADD = libmesos.la
+bin_PROGRAMS += mesos
+mesos_SOURCES = cli/mesos.cpp
+mesos_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_LDADD = libmesos.la
+
+bin_PROGRAMS += mesos-execute
+mesos_execute_SOURCES = cli/execute.cpp
+mesos_execute_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_execute_LDADD = libmesos.la
+
+bin_PROGRAMS += mesos-resolve
+mesos_resolve_SOURCES = cli/resolve.cpp
+mesos_resolve_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_resolve_LDADD = libmesos.la
+
+# Need to distribute and install mesos-*.
+dist_bin_SCRIPTS +=							\
+  cli/mesos-ps
 
 # Need to distribute/install webui javascript. We use 'pkgdatadir'
 # instead of 'datadir' as the install directory so we get the the
@@ -370,20 +386,17 @@ mesos_mesos_LDADD = libmesos.la
 nobase_dist_pkgdata_DATA +=						\
   webui/master/static/js/controllers.js					\
   webui/master/static/js/app.js						\
-  webui/master/static/js/dashboard.js					\
   webui/master/static/js/jquery.pailer.js
 
 # Need to distribute/install webui CSS.
 nobase_dist_pkgdata_DATA +=						\
   webui/master/static/css/bootstrap-responsive-2.3.2.min.css		\
   webui/master/static/css/bootstrap-2.3.2.min.css			\
-  webui/master/static/css/graph.css					\
   webui/master/static/css/mesos.css
 
 # Need to distribute/install webui HTML.
 nobase_dist_pkgdata_DATA +=						\
   webui/master/static/browse.html					\
-  webui/master/static/dashboard.html					\
   webui/master/static/framework.html					\
   webui/master/static/frameworks.html					\
   webui/master/static/home.html						\
@@ -409,10 +422,6 @@ nobase_dist_pkgdata_DATA +=						\
   webui/master/static/js/ui-bootstrap-tpls-0.4.0.min.js			\
   webui/master/static/js/underscore-1.4.3.js				\
   webui/master/static/js/underscore-1.4.3.min.js			\
-  webui/master/static/js/cubism.v1.js					\
-  webui/master/static/js/cubism.v1.min.js				\
-  webui/master/static/js/d3.v2.js					\
-  webui/master/static/js/d3.v2.min.js					\
   webui/master/static/js/jquery-1.7.1.js				\
   webui/master/static/js/jquery-1.7.1.min.js				\
   webui/master/static/js/relative-date.js				\
