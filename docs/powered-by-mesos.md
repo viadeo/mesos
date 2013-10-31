@@ -1,5 +1,5 @@
 ---
-layout: page
+layout: documentation
 ---
 
 # Powered By Mesos
@@ -22,7 +22,6 @@ layout: page
 
 * [Spark](http://spark.incubator.apache.org/) cluster computing framework
 Spark
-http://spark.incubator.apache.org/index.html
 * [Chronos](https://github.com/airbnb/chronos)
 * [Marathon](https://github.com/mesosphere/marathon)
 
