@@ -1,0 +1,137 @@
+#!/usr/bin/env python
+
+import json
+import os
+import signal
+import sys
+import time
+import itertools
+
+from contextlib import closing
+from optparse import OptionParser
+from urllib2 import HTTPError, urlopen
+
+from mesos import http
+from mesos.cli import *
+from mesos.futures import *
+
+
+if sys.version_info < (2,6,0):
+    sys.stderr.write('Expecting Python >= 2.6\n')
+    sys.exit(1)
+
+def read_forever(slave, task, file):
+    framework_id = task['framework_id']
+    executor_id = task['executor_id']
+
+    # An executorless task has an empty executor ID in the master but
+    # uses the same executor ID as task ID in the slave.
+    if executor_id == "": executor_id = task['id']
+
+    # Get 'state.json' to get the executor directory.
+    try:
+      state = http.get(slave['pid'], '/slave(1)/state.json', None)
+    except:
+      sys.stderr.write('Failed to get state from slave\n')
+      sys.exit(1)
+
+    directory = None
+
+    for framework in itertools.chain(state['frameworks'],
+                                     state['completed_frameworks']):
+        if framework['id'] == framework_id:
+            for executor in itertools.chain(framework['executors'],
+                                            framework['completed_executors']):
+                if executor['id'] == executor_id:
+                    directory = executor['directory']
+                    break
+
+    if directory is None:
+        sys.stderr.write('Task directory not found\n')
+        sys.exit(1)
+
+    path = os.path.join(directory, file)
+
+    # Start streaming "pages" up to length.
+    PAGE_LENGTH = 1024
+    offset = 0
+
+    while True:
+        try:
+            result = http.get(slave['pid'],
+                '/files/read.json',
+                {'path': path,
+                 'offset': offset,
+                 'length': PAGE_LENGTH})
+        except HTTPError as error:
+            if error.code == 404:
+                sys.stderr.write('No such file or directory\n')
+            else:
+                sys.stderr.write('Failed to read file from slave\n')
+            sys.exit(1)
+        if len(result['data']) == 0:
+            time.sleep(0.5)
+            continue
+        offset += len(result['data'])
+        yield result['data']
+
+
+def main():
+    # Parse options for this script.
+    parser = OptionParser()
+    parser.add_option('--master')
+    parser.add_option('--framework')
+    parser.add_option('--task')
+    parser.add_option('--file')
+    (options, args) = parser.parse_args(sys.argv)
+
+    if options.master is None:
+        usage('Missing --master', parser)
+
+    if options.framework is None:
+        usage('Missing --framework', parser)
+
+    if options.task is None:
+        usage('Missing --task', parser)
+
+    if options.file is None:
+        usage('Missing --file', parser)
+
+    # Get the master's state.
+    try:
+        master_state = http.get(resolve(options.master), '/master/state.json')
+    except:
+        sys.stderr.write('Failed to get the master state\n')
+        sys.exit(1)
+
+    # Build a dict from slave ID to `slaves'.
+    slaves = {}
+    for slave in master_state['slaves']:
+        slaves[slave['id']] = slave
+
+    def tail(slave, task, file):
+        for data in read_forever(slave, task, options.file):
+            sys.stdout.write(data)
+            sys.stdout.flush()
+
+    for framework in itertools.chain(master_state['frameworks'], \
+                                     master_state['completed_frameworks']):
+        if framework['id'] == options.framework:
+            for task in itertools.chain(framework['tasks'], framework['completed_tasks']):
+                if (task['id'] == options.task):
+                    tail(slaves[task['slave_id']], task, options.file)
+                    sys.exit(0)
+
+    sys.stderr.write('No task or framework found!\n')
+    sys.stderr.flush()
+    sys.exit(-1)
+
+
+if __name__ == '__main__':
+  def signal_handler(signal, frame):
+    sys.stdout.write('\n')
+    sys.exit(130)
+
+  signal.signal(signal.SIGINT, signal_handler)
+
+  main()
