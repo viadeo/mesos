@@ -284,6 +284,11 @@ message ResourceStatistics {
   // Amount of memory resources allocated.
   optional uint64 mem_limit_bytes = 6;
 
+  // Broken out memory usage information (files, anonymous, and mmaped files)
+  optional uint64 mem_file_bytes = 10;
+  optional uint64 mem_anon_bytes = 11;
+  optional uint64 mem_mapped_file_bytes = 12;
+
   // TODO(bmahler): Add disk usage.
   // TODO(bmahler): Add network usage?
 }
@@ -389,6 +394,7 @@ message TaskStatus {
   optional string message = 4; // Possible message explaining state.
   optional bytes data = 3;
   optional SlaveID slave_id = 5;
+  optional double timestamp = 6;
 }
 
 
@@ -429,8 +435,8 @@ message Parameter {
   required string key = 1;
   required string value = 2;
 }
- 
- 
+
+
 /**
  * Collection of Parameter.
  */
