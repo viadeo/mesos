@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <map>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -20,7 +19,6 @@
 
 #include "logging/logging.hpp"
 
-#include "zookeeper/authentication.hpp"
 #include "zookeeper/group.hpp"
 #include "zookeeper/watcher.hpp"
 #include "zookeeper/zookeeper.hpp"
@@ -30,7 +28,6 @@ using namespace process;
 using process::wait; // Necessary on some OS's to disambiguate.
 
 using std::make_pair;
-using std::map;
 using std::queue;
 using std::set;
 using std::string;
@@ -40,129 +37,7 @@ using std::vector;
 namespace zookeeper {
 
 // Time to wait after retryable errors.
-const Duration RETRY_INTERVAL = Seconds(2);
-
-
-class GroupProcess : public Process<GroupProcess>
-{
-public:
-  GroupProcess(const string& servers,
-               const Duration& timeout,
-               const string& znode,
-               const Option<Authentication>& auth);
-  virtual ~GroupProcess();
-
-  virtual void initialize();
-
-  // Group implementation.
-  Future<Group::Membership> join(const string& data);
-  Future<bool> cancel(const Group::Membership& membership);
-  Future<string> data(const Group::Membership& membership);
-  Future<set<Group::Membership> > watch(
-      const set<Group::Membership>& expected);
-  Future<Option<int64_t> > session();
-
-  // ZooKeeper events.
-  void connected(bool reconnect);
-  void reconnecting();
-  void expired();
-  void updated(const string& path);
-  void created(const string& path);
-  void deleted(const string& path);
-
-private:
-  Result<Group::Membership> doJoin(const string& data);
-  Result<bool> doCancel(const Group::Membership& membership);
-  Result<string> doData(const Group::Membership& membership);
-
-  // Attempts to cache the current set of memberships.
-  bool cache();
-
-  // Updates any pending watches.
-  void update();
-
-  // Synchronizes pending operations with ZooKeeper and also attempts
-  // to cache the current set of memberships if necessary.
-  bool sync();
-
-  // Generic retry method. This mechanism is "generic" in the sense
-  // that it is not specific to any particular operation, but rather
-  // attempts to perform all pending operations (including caching
-  // memberships if necessary).
-  void retry(const Duration& duration);
-
-  // Fails all pending operations.
-  void abort();
-
-  Option<string> error; // Potential non-retryable error.
-
-  const string servers;
-  const Duration timeout;
-  const string znode;
-
-  Option<Authentication> auth; // ZooKeeper authentication.
-
-  const ACL_vector acl; // Default ACL to use.
-
-  Watcher* watcher;
-  ZooKeeper* zk;
-
-  enum State { // ZooKeeper connection state.
-    DISCONNECTED,
-    CONNECTING,
-    CONNECTED,
-  } state;
-
-  struct Join
-  {
-    Join(const string& _data) : data(_data) {}
-    string data;
-    Promise<Group::Membership> promise;
-  };
-
-  struct Cancel
-  {
-    Cancel(const Group::Membership& _membership)
-      : membership(_membership) {}
-    Group::Membership membership;
-    Promise<bool> promise;
-  };
-
-  struct Data
-  {
-    Data(const Group::Membership& _membership)
-      : membership(_membership) {}
-    Group::Membership membership;
-    Promise<string> promise;
-  };
-
-  struct Watch
-  {
-    Watch(const set<Group::Membership>& _expected)
-      : expected(_expected) {}
-    set<Group::Membership> expected;
-    Promise<set<Group::Membership> > promise;
-  };
-
-  struct {
-    queue<Join*> joins;
-    queue<Cancel*> cancels;
-    queue<Data*> datas;
-    queue<Watch*> watches;
-  } pending;
-
-  bool retrying;
-
-  // Expected ZooKeeper sequence numbers (either owned/created by this
-  // group instance or not) and the promise we associate with their
-  // "cancellation" (i.e., no longer part of the group).
-  map<uint64_t, Promise<bool>*> owned;
-  map<uint64_t, Promise<bool>*> unowned;
-
-  // Cache of owned + unowned, where 'None' represents an invalid
-  // cache and 'Some' represents a valid cache.
-  Option<set<Group::Membership> > memberships;
-};
+const Duration GroupProcess::RETRY_INTERVAL = Seconds(2);
 
 
 // Helper for failing a queue of promises.
@@ -188,6 +63,25 @@ GroupProcess::GroupProcess(
     znode(strings::remove(_znode, "/", strings::SUFFIX)),
     auth(_auth),
     acl(_auth.isSome()
+        ? EVERYONE_READ_CREATOR_ALL
+        : ZOO_OPEN_ACL_UNSAFE),
+    watcher(NULL),
+    zk(NULL),
+    state(DISCONNECTED),
+    retrying(false)
+{}
+
+
+// TODO(xujyan): Reuse the peer constructor above once we switch to
+// C++ 11.
+GroupProcess::GroupProcess(
+    const URL& url,
+    const Duration& _timeout)
+  : servers(url.servers),
+    timeout(_timeout),
+    znode(strings::remove(url.path, "/", strings::SUFFIX)),
+    auth(url.authentication),
+    acl(url.authentication.isSome()
         ? EVERYONE_READ_CREATOR_ALL
         : ZOO_OPEN_ACL_UNSAFE),
     watcher(NULL),
@@ -427,6 +321,14 @@ void GroupProcess::connected(bool reconnect)
       abort(); // Cancels everything pending.
       return;
     }
+  } else {
+    LOG(INFO) << "Group process (" << self() << ")  reconnected to Zookeeper";
+
+    // Cancel and cleanup the reconnect timer (if necessary).
+    if (timer.isSome()) {
+      Timer::cancel(timer.get());
+      timer = None();
+    }
   }
 
   state = CONNECTED;
@@ -437,12 +339,49 @@ void GroupProcess::connected(bool reconnect)
 
 void GroupProcess::reconnecting()
 {
+  LOG(INFO) << "Lost connection to ZooKeeper, attempting to reconnect ...";
+
   state = CONNECTING;
+
+  // ZooKeeper won't tell us of a session expiration until we
+  // reconnect, which could occur much much later than the session was
+  // actually expired. This can lead to a prolonged split-brain
+  // scenario when network partitions occur. Rather than wait for a
+  // reconnection to occur (i.e., a network partition to be repaired)
+  // we create a local timer and "expire" our session prematurely if
+  // we haven't reconnected within the session expiration time out.
+  // The timer can be reset if the connection is restored.
+  CHECK(timer.isNone());
+  timer = delay(timeout, self(), &Self::timedout, zk->getSessionId());
+}
+
+
+void GroupProcess::timedout(const int64_t& sessionId)
+{
+  CHECK_NOTNULL(zk);
+
+  if (timer.isSome() &&
+      timer.get().timeout().expired() &&
+      zk->getSessionId() == sessionId) {
+    // The timer can be reset or replaced and 'zk' can be replaced
+    // since this method was dispatched.
+    std::ostringstream error_;
+    error_ << "Timed out waiting to reconnect to ZooKeeper (sessionId="
+           << std::hex << sessionId << ")";
+    error = error_.str();
+    abort();
+  }
 }
 
 
 void GroupProcess::expired()
 {
+  // Cancel and cleanup the reconnect timer (if necessary).
+  if (timer.isSome()) {
+    Timer::cancel(timer.get());
+    timer = None();
+  }
+
   // Invalidate the cache.
   memberships = None();
 
@@ -462,7 +401,9 @@ void GroupProcess::expired()
 
   state = DISCONNECTED;
 
-  delete zk;
+  delete CHECK_NOTNULL(zk);
+  delete CHECK_NOTNULL(watcher);
+  watcher = new ProcessWatcher<GroupProcess>(self());
   zk = new ZooKeeper(servers, timeout, watcher);
 
   state = CONNECTING;
@@ -559,6 +500,10 @@ Result<bool> GroupProcess::doCancel(const Group::Membership& membership)
   if (code == ZINVALIDSTATE || (code != ZOK && zk->retryable(code))) {
     CHECK(zk->getState() != ZOO_AUTH_FAILED_STATE);
     return None();
+  } else if (code == ZNONODE) {
+    // This can happen because the membership could have expired but
+    // we have yet to receive the update about it.
+    return false;
   } else if (code != ZOK) {
     return Error(
         "Failed to remove ephemeral node '" + path +
@@ -800,8 +745,13 @@ void GroupProcess::abort()
   fail(&pending.datas, error.get());
   fail(&pending.watches, error.get());
 
-  // TODO(benh): Delete the ZooKeeper instance in order to terminate
-  // our session (cleaning up any ephemeral znodes as necessary)?
+  error = None();
+
+  // If we decide to abort, make sure we expire the session
+  // (cleaning up any ephemeral ZNodes as necessary). We also
+  // create a new ZooKeeper instance for clients that want to
+  // continue to reuse this group instance.
+  expired();
 }
 
 
@@ -811,6 +761,14 @@ Group::Group(const string& servers,
              const Option<Authentication>& auth)
 {
   process = new GroupProcess(servers, timeout, znode, auth);
+  spawn(process);
+}
+
+
+Group::Group(const URL& url,
+             const Duration& timeout)
+{
+  process = new GroupProcess(url, timeout);
   spawn(process);
 }
 
