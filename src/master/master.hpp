@@ -41,7 +41,6 @@
 #include <stout/owned.hpp>
 
 #include "common/type_utils.hpp"
-#include "common/units.hpp"
 
 #include "files/files.hpp"
 
@@ -110,19 +109,24 @@ public:
       const process::UPID& from,
       const FrameworkID& frameworkId);
   void resourceRequest(
+      const process::UPID& from,
       const FrameworkID& frameworkId,
       const std::vector<Request>& requests);
   void launchTasks(
+      const process::UPID& from,
       const FrameworkID& frameworkId,
       const OfferID& offerId,
       const std::vector<TaskInfo>& tasks,
       const Filters& filters);
   void reviveOffers(
+      const process::UPID& from,
       const FrameworkID& frameworkId);
   void killTask(
+      const process::UPID& from,
       const FrameworkID& frameworkId,
       const TaskID& taskId);
   void schedulerMessage(
+      const process::UPID& from,
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,

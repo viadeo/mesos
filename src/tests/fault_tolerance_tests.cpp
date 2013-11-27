@@ -55,7 +55,7 @@ using mesos::internal::master::Master;
 
 using mesos::internal::slave::Isolator;
 using mesos::internal::slave::Slave;
-using mesos::internal::slave::STATUS_UPDATE_RETRY_INTERVAL;
+using mesos::internal::slave::STATUS_UPDATE_RETRY_INTERVAL_MIN;
 
 using process::Clock;
 using process::Future;
@@ -1072,7 +1072,7 @@ TEST_F(FaultToleranceTest, SchedulerFailoverStatusUpdate)
   EXPECT_CALL(sched2, statusUpdate(&driver2, _))
     .WillOnce(FutureSatisfy(&statusUpdate));
 
-  Clock::advance(STATUS_UPDATE_RETRY_INTERVAL);
+  Clock::advance(STATUS_UPDATE_RETRY_INTERVAL_MIN);
 
   AWAIT_READY(statusUpdate);
 
@@ -1365,6 +1365,127 @@ TEST_F(FaultToleranceTest, SchedulerFailoverFrameworkMessage)
   execDriver->sendFrameworkMessage("Executor to Framework message");
 
   AWAIT_READY(frameworkMessage);
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver1.stop();
+  driver2.stop();
+
+  driver1.join();
+  driver2.join();
+
+  Shutdown();
+}
+
+
+// This test verifies that a partitioned framework that still
+// thinks it is registered with the master cannot kill a task because
+// the master has re-registered another instance of the framework.
+// What this test does:
+// 1. Launch a master, slave and scheduler.
+// 2. Scheduler launches a task.
+// 3. Launch a second failed over scheduler.
+// 4. Make the first scheduler believe it is still registered.
+// 5. First scheduler attempts to kill the task which is ignored by the master.
+TEST_F(FaultToleranceTest, IgnoreKillTaskFromUnregisteredFramework)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  Try<PID<Slave> > slave = StartSlave(&exec);
+  ASSERT_SOME(slave);
+
+  // Start the first scheduler and launch a task.
+  MockScheduler sched1;
+  MesosSchedulerDriver driver1(
+      &sched1, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  FrameworkID frameworkId;
+  EXPECT_CALL(sched1, registered(&driver1, _, _))
+    .WillOnce(SaveArg<1>(&frameworkId));
+
+  EXPECT_CALL(sched1, resourceOffers(&driver1, _))
+    .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 512, "*"))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched1, statusUpdate(&driver1, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  ExecutorDriver* execDriver;
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .WillOnce(SaveArg<0>(&execDriver));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  driver1.start();
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  // Now start the second failed over scheduler.
+  MockScheduler sched2;
+
+  FrameworkInfo framework2; // Bug in gcc 4.1.*, must assign on next line.
+  framework2 = DEFAULT_FRAMEWORK_INFO;
+  framework2.mutable_id()->MergeFrom(frameworkId);
+
+  MesosSchedulerDriver driver2(
+      &sched2, framework2, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched2, registered(&driver2, frameworkId, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  EXPECT_CALL(sched2, resourceOffers(&driver2, _))
+    .WillRepeatedly(Return()); // Ignore any offers.
+
+  // Drop the framework error message from the master to simulate
+  // a partitioned framework.
+  Future<FrameworkErrorMessage> frameworkErrorMessage =
+    DROP_PROTOBUF(FrameworkErrorMessage(), _ , _);
+
+  driver2.start();
+
+  AWAIT_READY(frameworkErrorMessage);
+
+  AWAIT_READY(registered);
+
+  // Now both the frameworks think they are registered with the
+  // master, but the master only knows about the second framework.
+
+  // A 'killTask' by first framework should be dropped by the master.
+  EXPECT_CALL(sched1, statusUpdate(&driver1, _))
+    .Times(0);
+
+  // 'TASK_FINSIHED' by the executor should reach the second framework.
+  Future<TaskStatus> status2;
+  EXPECT_CALL(sched2, statusUpdate(&driver2, _))
+    .WillOnce(FutureArg<1>(&status2));
+
+  Future<KillTaskMessage> killTaskMessage =
+    FUTURE_PROTOBUF(KillTaskMessage(), _, _);
+
+  driver1.killTask(status.get().task_id());
+
+  AWAIT_READY(killTaskMessage);
+
+  // By this point the master must have processed and ignored the
+  // 'killTask' message from the first framework. To verify this,
+  // the executor sends 'TASK_FINISHED' to ensure the only update
+  // received by the scheduler is 'TASK_FINISHED' and not
+  // 'TASK_KILLED'.
+  TaskStatus finishedStatus;
+  finishedStatus = status.get();
+  finishedStatus.set_state(TASK_FINISHED);
+  execDriver->sendStatusUpdate(finishedStatus);
+
+  AWAIT_READY(status2);
+  EXPECT_EQ(TASK_FINISHED, status2.get().state());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -1732,7 +1853,8 @@ TEST_F(FaultToleranceTest, ReconcileIncompleteTasks)
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return()); // Ignore retried update due to update framework.
 
   Clock::pause();
 
@@ -1762,6 +1884,95 @@ TEST_F(FaultToleranceTest, ReconcileIncompleteTasks)
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// This test ensures that if a master incorrectly thinks that it is
+// leading, the scheduler driver will drop messages from this master.
+// Unfortunately, it is not currently possible to start more than one
+// master within the same process. So, this test merely simulates this
+// by spoofing messages.
+// This test does the following:
+//   1. Start a master, scheduler, launch a task.
+//   2. Spoof a lost task message for the slave.
+//   3. Once the message is sent to the scheduler, kill the task.
+//   4. Ensure the task was KILLED rather than LOST.
+TEST_F(FaultToleranceTest, SplitBrainMasters)
+{
+  // 1. Start a master, scheduler, and launch a task.
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  Try<PID<Slave> > slave = StartSlave(&exec);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<Message> registered =
+    FUTURE_MESSAGE(Eq(FrameworkRegisteredMessage().GetTypeName()), _, _);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 512, "*"))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> runningStatus;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&runningStatus));
+
+  driver.start();
+
+  AWAIT_READY(registered);
+  AWAIT_READY(frameworkId);
+  AWAIT_READY(runningStatus);
+  EXPECT_EQ(TASK_RUNNING, runningStatus.get().state());
+
+  // 2. Spoof a lost task message for the slave.
+  StatusUpdateMessage lostUpdate;
+  lostUpdate.mutable_update()->CopyFrom(createStatusUpdate(
+      frameworkId.get(),
+      runningStatus.get().slave_id(),
+      runningStatus.get().task_id(),
+      TASK_LOST));
+
+  // Spoof a message from a random master; this should be dropped by
+  // the scheduler driver. Since this is delivered locally, it is
+  // synchronously placed on the scheduler driver's queue.
+  process::post(UPID("master2@127.0.0.1:50"), registered.get().to, lostUpdate);
+
+  // 3. Once the message is sent to the scheduler, kill the task.
+  EXPECT_CALL(exec, killTask(_, _))
+    .WillOnce(SendStatusUpdateFromTaskID(TASK_KILLED));
+
+  Future<TaskStatus> killedStatus;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&killedStatus));
+
+  driver.killTask(runningStatus.get().task_id());
+
+  // 4. Ensure the task was KILLED rather than LOST.
+  AWAIT_READY(killedStatus);
+  EXPECT_EQ(TASK_KILLED, killedStatus.get().state());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .WillRepeatedly(Return());
 
   driver.stop();
   driver.join();
