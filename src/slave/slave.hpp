@@ -31,6 +31,7 @@
 
 #include <process/http.hpp>
 #include <process/future.hpp>
+#include <process/owned.hpp>
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
 
@@ -41,7 +42,6 @@
 #include <stout/multihashmap.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
-#include <stout/owned.hpp>
 #include <stout/path.hpp>
 #include <stout/uuid.hpp>
 
@@ -95,6 +95,7 @@ public:
   void doReliableRegistration();
 
   void runTask(
+      const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       const FrameworkID& frameworkId,
       const std::string& pid,
@@ -109,7 +110,10 @@ public:
 
   Future<bool> unschedule(const std::string& path);
 
-  void killTask(const FrameworkID& frameworkId, const TaskID& taskId);
+  void killTask(
+      const process::UPID& from,
+      const FrameworkID& frameworkId,
+      const TaskID& taskId);
 
   void shutdownFramework(
       const process::UPID& from,

@@ -18,6 +18,7 @@
 #include <process/pid.hpp>
 
 #include <stout/duration.hpp>
+#include <stout/error.hpp>
 #include <stout/option.hpp>
 #include <stout/preprocessor.hpp>
 
@@ -254,6 +255,33 @@ private:
 };
 
 
+// Helper for creating failed futures.
+struct _Failure
+{
+  _Failure(const std::string& _message) : message(_message) {}
+
+  template <typename T>
+  operator Future<T> () const
+  {
+    return Future<T>::failed(message);
+  }
+
+  const std::string message;
+};
+
+
+inline _Failure Failure(const std::string& message)
+{
+  return _Failure(message);
+}
+
+
+inline _Failure Failure(const Error& error)
+{
+  return _Failure(error.message);
+}
+
+
 // TODO(benh): Make Promise a subclass of Future?
 template <typename T>
 class Promise
@@ -318,6 +346,14 @@ bool Promise<T>::set(const Future<T>& future)
 template <typename T>
 bool Promise<T>::associate(const Future<T>& future)
 {
+  // TODO(jieyu): Make 'f' a true alias of 'future'. Currently, only
+  // 'discard' is associated in both directions. In other words, if a
+  // future gets discarded, the other future will also get discarded.
+  // For 'set' and 'fail', they are associated only in one direction.
+  // In other words, calling 'set' or 'fail' on this promise will not
+  // affect the result of the future that we associated.
+  f.onDiscarded(std::tr1::bind(&Future<T>::discard, future));
+
   if (!f.isPending()) {
     return false;
   }

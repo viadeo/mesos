@@ -30,6 +30,7 @@
 
 #include <process/future.hpp>
 #include <process/gmock.hpp>
+#include <process/owned.hpp>
 #include <process/pid.hpp>
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
@@ -60,6 +61,7 @@ using mesos::internal::slave::STATUS_UPDATE_RETRY_INTERVAL_MIN;
 using process::Clock;
 using process::Future;
 using process::Message;
+using process::Owned;
 using process::PID;
 using process::UPID;
 
@@ -864,8 +866,8 @@ TEST_F(FaultToleranceTest, FrameworkReregister)
   Try<PID<Master> > master = StartMaster();
   ASSERT_SOME(master);
 
-  Owned<MasterDetector> slaveDetector =
-    new StandaloneMasterDetector(master.get());
+  Owned<MasterDetector> slaveDetector(
+      new StandaloneMasterDetector(master.get()));
   Try<PID<Slave> > slave = StartSlave(slaveDetector);
   ASSERT_SOME(slave);
 
@@ -873,8 +875,8 @@ TEST_F(FaultToleranceTest, FrameworkReregister)
   // Create a detector for the scheduler driver because we want the
   // spurious leading master change to be known by the scheduler
   // driver only.
-  Owned<MasterDetector> schedDetector =
-    new StandaloneMasterDetector(master.get());
+  Owned<MasterDetector> schedDetector(
+      new StandaloneMasterDetector(master.get()));
   MockScheduler sched;
   TestingMesosSchedulerDriver driver(&sched, schedDetector.get());
 
@@ -1060,6 +1062,12 @@ TEST_F(FaultToleranceTest, SchedulerFailoverStatusUpdate)
   // Scheduler1 should get an error due to failover.
   EXPECT_CALL(sched1, error(&driver1, "Framework failed over"));
 
+  // Scheduler2 should receive retried status updates.
+  Future<Nothing> statusUpdate;
+  EXPECT_CALL(sched2, statusUpdate(&driver2, _))
+    .WillOnce(FutureSatisfy(&statusUpdate))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
   driver2.start();
 
   AWAIT_READY(registered2);
@@ -1068,10 +1076,6 @@ TEST_F(FaultToleranceTest, SchedulerFailoverStatusUpdate)
 
   // Now advance time enough for the reliable timeout
   // to kick in and another status update is sent.
-  Future<Nothing> statusUpdate;
-  EXPECT_CALL(sched2, statusUpdate(&driver2, _))
-    .WillOnce(FutureSatisfy(&statusUpdate));
-
   Clock::advance(STATUS_UPDATE_RETRY_INTERVAL_MIN);
 
   AWAIT_READY(statusUpdate);
@@ -1105,13 +1109,14 @@ TEST_F(FaultToleranceTest, ReregisterFrameworkExitedExecutor)
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
   TestingIsolator isolator(&exec);
-  Owned<MasterDetector> slaveDetector = new StandaloneMasterDetector(master.get());
+  Owned<MasterDetector> slaveDetector(
+      new StandaloneMasterDetector(master.get()));
   Try<PID<Slave> > slave = StartSlave(&isolator, slaveDetector);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
-  Owned<StandaloneMasterDetector> schedDetector =
-    new StandaloneMasterDetector(master.get());
+  Owned<StandaloneMasterDetector> schedDetector(
+      new StandaloneMasterDetector(master.get()));
   TestingMesosSchedulerDriver driver(&sched, schedDetector.get());
 
   Future<process::Message> frameworkRegisteredMessage =
@@ -1170,17 +1175,18 @@ TEST_F(FaultToleranceTest, ReregisterFrameworkExitedExecutor)
   // Wait for the slave to re-register.
   AWAIT_READY(slaveReregisteredMessage);
 
-  // Allow the executor exited message and drop the status update.
+  // Allow the executor exited message and drop the status update,
+  // it's possible for a duplicate update to occur if the status
+  // update manager is notified of the new master after the task was
+  // killed.
   Future<ExitedExecutorMessage> executorExitedMessage =
     FUTURE_PROTOBUF(ExitedExecutorMessage(), _, _);
-  Future<StatusUpdateMessage> statusUpdateMessage =
-    DROP_PROTOBUF(StatusUpdateMessage(), _, _);
+  DROP_PROTOBUFS(StatusUpdateMessage(), _, _);
 
   // Now kill the executor.
   dispatch(isolator, &Isolator::killExecutor, frameworkId, DEFAULT_EXECUTOR_ID);
 
   AWAIT_READY(executorExitedMessage);
-  AWAIT_READY(statusUpdateMessage);
 
   // Now notify the framework of the new master.
   Future<FrameworkRegisteredMessage> frameworkRegisteredMessage2 =

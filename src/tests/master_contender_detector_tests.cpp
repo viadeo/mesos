@@ -30,6 +30,7 @@
 
 #include <process/clock.hpp>
 #include <process/future.hpp>
+#include <process/owned.hpp>
 #include <process/pid.hpp>
 #include <process/protobuf.hpp>
 
@@ -66,6 +67,7 @@ using mesos::internal::slave::Slave;
 
 using process::Clock;
 using process::Future;
+using process::Owned;
 using process::PID;
 using process::UPID;
 
@@ -99,7 +101,7 @@ TEST_F(MasterContenderDetectorTest, File)
 
   ASSERT_SOME(detector);
 
-  StartSlave(detector.get(), flags);
+  StartSlave(Owned<MasterDetector>(detector.get()), flags);
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -291,6 +293,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderDetectorShutdownNetwork)
   ZooKeeperMasterDetector detector(url.get());
 
   Future<Result<UPID> > leader = detector.detect();
+  AWAIT_READY(leader);
   EXPECT_SOME_EQ(master, leader.get());
 
   leader = detector.detect(leader.get());
@@ -300,28 +303,29 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderDetectorShutdownNetwork)
 
   // We may need to advance multiple times because we could have
   // advanced the clock before the timer in Group starts.
-  while (lostCandidacy.isPending()) {
+  while (lostCandidacy.isPending() || leader.isPending()) {
     Clock::advance(std::max(
         MASTER_DETECTOR_ZK_SESSION_TIMEOUT,
         MASTER_CONTENDER_ZK_SESSION_TIMEOUT));
     Clock::settle();
   }
 
-  AWAIT_EXPECT_FAILED(lostCandidacy);
-  AWAIT_READY(leader);
+  EXPECT_TRUE(lostCandidacy.isFailed());
   EXPECT_ERROR(leader.get());
 
-  // Retry.
+  // Re-contend and re-detect.
   contended = contender.contend();
   leader = detector.detect(leader.get());
 
-  // Things will not change until the contender reconnects.
+  // Things will not change until the server restarts.
   Clock::advance(Minutes(1));
   Clock::settle();
   EXPECT_TRUE(contended.isPending());
   EXPECT_TRUE(leader.isPending());
 
   server->startNetwork();
+
+  // Operations will eventually succeed after ZK is restored.
   AWAIT_READY(contended);
   AWAIT_READY(leader);
 

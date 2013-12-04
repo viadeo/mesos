@@ -31,7 +31,6 @@
 #include <stout/multihashmap.hpp>
 #include <stout/nothing.hpp>
 #include <stout/os.hpp>
-#include <stout/owned.hpp>
 #include <stout/path.hpp>
 #include <stout/utils.hpp>
 #include <stout/uuid.hpp>
@@ -97,14 +96,14 @@ protected:
       } else if (read.get().empty()) {
         LOG(WARNING) << "Empty whitelist file " << path << ". "
                      << "No offers will be made!";
-        whitelist = Option<hashset<string> >::some(hashset<string>());
+        whitelist = hashset<string>();
       } else {
         hashset<string> hostnames;
         vector<string> lines = strings::tokenize(read.get(), "\n");
         foreach (const string& hostname, lines) {
           hostnames.insert(hostname);
         }
-        whitelist = Option<hashset<string> >::some(hostnames);
+        whitelist = hostnames;
       }
     }
 
@@ -1841,10 +1840,10 @@ void Master::authenticate(const UPID& from, const UPID& pid)
 
   // Create a promise to capture the entire "authenticating"
   // procedure. We'll set this _after_ we finish _authenticate.
-  Owned<Promise<Nothing> > promise = new Promise<Nothing>();
+  Owned<Promise<Nothing> > promise(new Promise<Nothing>());
 
   // Create the authenticator.
-  Owned<sasl::Authenticator> authenticator = new sasl::Authenticator(from);
+  Owned<sasl::Authenticator> authenticator(new sasl::Authenticator(from));
 
   // Start authentication.
   const Future<bool>& future = authenticator->authenticate()
@@ -2230,7 +2229,7 @@ Resources Master::launchTask(const TaskInfo& task,
       resources += task.executor().resources();
     }
 
-    executorId = Option<ExecutorID>::some(task.executor().executor_id());
+    executorId = task.executor().executor_id();
   }
 
   // Add the task to the framework and slave.

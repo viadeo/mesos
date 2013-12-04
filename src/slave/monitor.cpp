@@ -96,7 +96,7 @@ Future<Nothing> ResourceMonitorProcess::watch(
 {
   if (watches.contains(frameworkId) &&
       watches[frameworkId].contains(executorId)) {
-    return Future<Nothing>::failed("Already watched");
+    return Failure("Already watched");
   }
 
   watches[frameworkId][executorId] = executorInfo;
@@ -108,7 +108,7 @@ Future<Nothing> ResourceMonitorProcess::watch(
   ::statistics->meter(
       "monitor",
       prefix + CPUS_TIME_SECS,
-      new meters::TimeRate(prefix + CPU_USAGE));
+      Owned<meters::Meter>(new meters::TimeRate(prefix + CPU_USAGE)));
 
   // Schedule the resource collection.
   delay(interval, self(), &Self::collect, frameworkId, executorId, interval);
@@ -142,7 +142,7 @@ Future<Nothing> ResourceMonitorProcess::unwatch(
 
   if (!watches.contains(frameworkId) ||
       !watches[frameworkId].contains(executorId)) {
-    return Future<Nothing>::failed("Not watched");
+    return Failure("Not watched");
   }
 
   watches[frameworkId].erase(executorId);
