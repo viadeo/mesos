@@ -1,8 +1,8 @@
 (function() {
   'use strict';
 
-  angular.module('mesos', ['mesos.services', 'ui.bootstrap']).
-    config(['$dialogProvider', '$routeProvider', function($dialogProvider, $routeProvider) {
+  angular.module('mesos', ['ngRoute', 'mesos.services', 'ui.bootstrap', 'ui.bootstrap.dialog']).
+    config(['$routeProvider', function($routeProvider) {
       $routeProvider
         .when('/',
           {templateUrl: 'static/home.html', controller: 'HomeCtrl'})
@@ -36,8 +36,6 @@
           {templateUrl: 'static/browse.html', controller: 'BrowseCtrl'})
         .otherwise({redirectTo: '/'});
 
-      $dialogProvider.options({dialogFade: true});
-
       ZeroClipboard.setDefaults({
         moviePath: '/static/obj/zeroclipboard-1.1.7.swf'
       });
@@ -65,12 +63,12 @@
     })
     .filter('isoDate', function($filter) {
       return function(date) {
-        return $filter('date')(date, 'yyyy-MM-dd H:mm:ss');
+        return $filter('date')(date, 'yyyy-MM-ddTH:mm:ssZ');
       };
     })
     .filter('relativeDate', function() {
-      return function(date) {
-        return relativeDate(date);
+      return function(date, refDate) {
+        return relativeDate(date, refDate);
       };
     })
     .filter('unixDate', function($filter) {

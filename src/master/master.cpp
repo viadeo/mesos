@@ -521,6 +521,9 @@ void Master::initialize()
   route("/roles.json",
         None(),
         lambda::bind(&Http::roles, http, lambda::_1));
+  route("/tasks.json",
+        Http::TASKS_HELP,
+        lambda::bind(&Http::tasks, http, lambda::_1));
 
   // Provide HTTP assets from a "webui" directory. This is either
   // specified via flags (which is necessary for running out of the
@@ -1549,7 +1552,8 @@ void Master::statusUpdate(const StatusUpdate& update, const UPID& pid)
   LOG(INFO) << "Status update " << update << " from " << pid;
 
   // TODO(brenden) Consider wiping the `data` and `message` fields?
-  if (task->state() == status.state()) {
+  if (task->statuses_size() > 0 &&
+      task->statuses(task->statuses_size() - 1).state() == status.state()) {
     task->mutable_statuses()->RemoveLast();
   }
   task->add_statuses()->CopyFrom(status);
@@ -1811,6 +1815,12 @@ void Master::offer(const FrameworkID& frameworkId,
 // 'authenticate' message doesn't contain the 'FrameworkID'.
 void Master::authenticate(const UPID& from, const UPID& pid)
 {
+  if (!elected()) {
+    LOG(WARNING) << "Ignoring authenticate message from " << from
+                 << " since not elected yet";
+    return;
+  }
+
   // Deactivate the framework if it's already registered.
   foreachvalue (Framework* framework, frameworks) {
     if (framework->pid == pid) {

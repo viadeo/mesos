@@ -817,8 +817,6 @@ TEST_F(FaultToleranceTest, SchedulerFailoverRetriedReregistration)
 
 TEST_F(FaultToleranceTest, FrameworkReliableRegistration)
 {
-  Clock::pause();
-
   Try<PID<Master> > master = StartMaster();
   ASSERT_SOME(master);
 
@@ -839,15 +837,22 @@ TEST_F(FaultToleranceTest, FrameworkReliableRegistration)
   EXPECT_CALL(sched, offerRescinded(&driver, _))
     .Times(AtMost(1));
 
+  Future<AuthenticateMessage> authenticateMessage =
+    FUTURE_PROTOBUF(AuthenticateMessage(), _, master.get());
+
   // Drop the first framework registered message, allow subsequent messages.
   Future<FrameworkRegisteredMessage> frameworkRegisteredMessage =
-    DROP_PROTOBUF(FrameworkRegisteredMessage(), _, _);
+    DROP_PROTOBUF(FrameworkRegisteredMessage(), master.get(), _);
 
   driver.start();
+
+  // Ensure authentication occurs.
+  AWAIT_READY(authenticateMessage);
 
   AWAIT_READY(frameworkRegisteredMessage);
 
   // TODO(benh): Pull out constant from SchedulerProcess.
+  Clock::pause();
   Clock::advance(Seconds(1));
 
   AWAIT_READY(registered); // Ensures registered message is received.
@@ -1571,8 +1576,6 @@ TEST_F(FaultToleranceTest, SchedulerExit)
 
 TEST_F(FaultToleranceTest, SlaveReliableRegistration)
 {
-  Clock::pause();
-
   Try<PID<Master> > master = StartMaster();
   ASSERT_SOME(master);
 
@@ -1587,7 +1590,9 @@ TEST_F(FaultToleranceTest, SlaveReliableRegistration)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _));
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
 
   Future<Nothing> resourceOffers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -1596,8 +1601,11 @@ TEST_F(FaultToleranceTest, SlaveReliableRegistration)
 
   driver.start();
 
+  AWAIT_READY(registered);
+
   AWAIT_READY(slaveRegisteredMessage);
 
+  Clock::pause();
   Clock::advance(Seconds(1)); // TODO(benh): Pull out constant from Slave.
 
   AWAIT_READY(resourceOffers);
@@ -1616,9 +1624,14 @@ TEST_F(FaultToleranceTest, SlaveReregisterOnZKExpiration)
   Try<PID<Master> > master = StartMaster();
   ASSERT_SOME(master);
 
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
   StandaloneMasterDetector* detector = new StandaloneMasterDetector(master.get());
   Try<PID<Slave> > slave = StartSlave(Owned<MasterDetector>(detector));
   ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
 
   MockScheduler sched;
   MesosSchedulerDriver driver(

@@ -17,6 +17,7 @@ EXTRA_DIST =					\
   include/stout/flags/flags.hpp			\
   include/stout/flags/loader.hpp		\
   include/stout/flags/parse.hpp			\
+  include/stout/flags/stringifier.hpp		\
   include/stout/foreach.hpp			\
   include/stout/format.hpp			\
   include/stout/fs.hpp				\
@@ -73,6 +74,7 @@ EXTRA_DIST =					\
   tests/main.cpp				\
   tests/multimap_tests.cpp			\
   tests/none_tests.cpp				\
+  tests/option_tests.cpp			\
   tests/os_tests.cpp				\
   tests/os/sendfile_tests.cpp			\
   tests/os/signals_tests.cpp			\

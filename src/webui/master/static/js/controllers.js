@@ -154,6 +154,14 @@
 
     $scope.data = data;
 
+    // Pass this pollTime to all relativeDate calls to make them all relative to
+    // the same moment in time.
+    //
+    // If relativeDate is called without a reference time, it instantiates a new
+    // Date to be the reference. Since there can be hundreds of dates on a given
+    // page, they would all be relative to slightly different moments in time.
+    $scope.pollTime = new Date();
+
     // Update the maps.
     $scope.slaves = {};
     $scope.frameworks = {};
@@ -222,8 +230,9 @@
           task.executor_id = task.id;
         }
         if (task.statuses.length > 0) {
-          task.start_time = task.statuses[0].timestamp;
-          task.finish_time = task.statuses[task.statuses.length - 1].timestamp;
+          task.start_time = task.statuses[0].timestamp * 1000;
+          task.finish_time =
+            task.statuses[task.statuses.length - 1].timestamp * 1000;
         }
       });
       _.each(framework.completed_tasks, function(task) {
@@ -231,8 +240,9 @@
           task.executor_id = task.id;
         }
         if (task.statuses.length > 0) {
-          task.start_time = task.statuses[0].timestamp;
-          task.finish_time = task.statuses[task.statuses.length - 1].timestamp;
+          task.start_time = task.statuses[0].timestamp * 1000;
+          task.finish_time =
+            task.statuses[task.statuses.length - 1].timestamp * 1000;
         }
       });
     });
@@ -260,7 +270,8 @@
   // In addition, the MainCntl encapsulates the "view", allowing the
   // active controller/view to easily access anything in scope (e.g.,
   // the state).
-  mesosApp.controller('MainCntl', function($scope, $http, $route, $routeParams, $location, $timeout) {
+  mesosApp.controller('MainCntl',
+      function($scope, $http, $route, $routeParams, $location, $timeout, $modal) {
     $scope.doneLoading = true;
 
     // Adding bindings into scope so that they can be used from within
@@ -303,37 +314,47 @@
             $scope.delay = $scope.delay * 2;
           }
 
+          var errorModal = $modal.open({
+            controller: function($scope, $modalInstance, scope) {
+              // Give the modal reference to the root scope so it can access the
+              // `retry` variable. It needs to be passed by reference, not by
+              // value, since its value is changed outside the scope of the
+              // modal.
+              $scope.rootScope = scope;
+            },
+            resolve: {
+              scope: function() { return $scope; }
+            },
+            templateUrl: "template/dialog/masterGone.html"
+          });
+
+          // Make it such that everytime we hide the error-modal, we stop the
+          // countdown and restart the polling.
+          errorModal.result.then(function() {
+            if ($scope.countdown != null) {
+              if ($timeout.cancel($scope.countdown)) {
+                // Restart since they cancelled the countdown.
+                $scope.delay = 2000;
+              }
+            }
+
+            // Start polling again, but do it asynchronously (and wait at
+            // least a second because otherwise the error-modal won't get
+            // properly shown).
+            $timeout(poll, 1000);
+          });
+
           $scope.retry = $scope.delay;
           var countdown = function() {
             if ($scope.retry === 0) {
-              $scope.errorModalClose();
+              errorModal.close();
             } else {
               $scope.retry = $scope.retry - 1000;
               $scope.countdown = $timeout(countdown, 1000);
             }
           };
-
           countdown();
-          $scope.errorModalOpen = true;
         });
-    };
-
-    // Make it such that everytime we hide the error-modal, we stop the
-    // countdown and restart the polling.
-    $scope.errorModalClose = function() {
-      $scope.errorModalOpen = false;
-
-      if ($scope.countdown != null) {
-        if ($timeout.cancel($scope.countdown)) {
-          // Restart since they cancelled the countdown.
-          $scope.delay = 2000;
-        }
-      }
-
-      // Start polling again, but do it asynchronously (and wait at
-      // least a second because otherwise the error-modal won't get
-      // properly shown).
-      $timeout(poll, 1000);
     };
 
     poll();
@@ -345,7 +366,6 @@
 
     $scope.tables = {};
     $scope.tables['frameworks'] = new Table('id');
-    $scope.tables['slaves'] = new Table('id');
     $scope.tables['completed_frameworks'] = new Table('id');
 
     $scope.columnClass = columnClass($scope);

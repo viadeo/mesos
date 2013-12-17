@@ -260,9 +260,27 @@ libmesos_no_3rdparty_la_LIBADD = # Initialized to enable using +=.
 noinst_LTLIBRARIES += libbuild.la
 libbuild_la_SOURCES = common/build.cpp
 libbuild_la_CPPFLAGS = $(AM_CPPFLAGS)
+libbuild_la_CPPFLAGS += $(MESOS_CPPFLAGS)
 libbuild_la_CPPFLAGS += -DBUILD_DATE="\"$$(date '+%Y-%m-%d %H:%M:%S')\""
 libbuild_la_CPPFLAGS += -DBUILD_TIME="\"$$(date '+%s')\""
 libbuild_la_CPPFLAGS += -DBUILD_USER="\"$$USER\""
+
+if GIT_REPO
+    BUILD_GIT_SHA=$$(sh -c 'cd $(top_srcdir); \
+        SHA=`git log -n 1 --format=%H 2> /dev/null` && \
+	echo -DBUILD_GIT_SHA=\"$$SHA\"')
+    libbuild_la_CPPFLAGS += $(BUILD_GIT_SHA)
+
+    BUILD_GIT_BRANCH=$$(sh -c 'cd $(top_srcdir); \
+        BRANCH=`git symbolic-ref HEAD 2> /dev/null` && \
+        echo -DBUILD_GIT_BRANCH=\"$$BRANCH\"')
+    libbuild_la_CPPFLAGS += $(BUILD_GIT_BRANCH)
+
+    BUILD_GIT_TAG=$$(sh -c 'cd $(top_srcdir); \
+        TAG=`git describe --exact --tags 2> /dev/null` && \
+        echo -DBUILD_GIT_TAG=\"$$TAG\"')
+    libbuild_la_CPPFLAGS += $(BUILD_GIT_TAG)
+endif
 
 # We need to escape the build flags properly.
 BUILD_FLAGS = $(echo $(MESOS_CPPFLAGS) $(CPPFLAGS) | sed 's/\"/\\\"/g')	\
@@ -387,6 +405,7 @@ mesos_resolve_LDADD = libmesos.la
 dist_bin_SCRIPTS +=							\
   cli/mesos-cat								\
   cli/mesos-ps								\
+  cli/mesos-scp								\
   cli/mesos-tail
 
 # Also install the supporting scripts for the Python based CLI tools.
@@ -440,10 +459,12 @@ nobase_dist_pkgdata_DATA +=						\
 
 # Need to distribute/install third-party javascript.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/js/angular-1.0.7.js				\
-  webui/master/static/js/angular-1.0.7.min.js				\
-  webui/master/static/js/ui-bootstrap-tpls-0.4.0.js			\
-  webui/master/static/js/ui-bootstrap-tpls-0.4.0.min.js			\
+  webui/master/static/js/angular-1.2.3.js				\
+  webui/master/static/js/angular-1.2.3.min.js				\
+  webui/master/static/js/angular-route-1.2.3.js			\
+  webui/master/static/js/angular-route-1.2.3.min.js			\
+  webui/master/static/js/ui-bootstrap-tpls-0.7.0.js			\
+  webui/master/static/js/ui-bootstrap-tpls-0.7.0.min.js		\
   webui/master/static/js/underscore-1.4.3.js				\
   webui/master/static/js/underscore-1.4.3.min.js			\
   webui/master/static/js/jquery-1.7.1.js				\
