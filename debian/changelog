@@ -1,4 +1,10 @@
-mesos (0.16.0-6) unstable; urgency=low
+mesos (0.17.0-1) unstable; urgency=low
+
+  * release 0.17
+
+ -- Damien Hardy <dhardy@viadeoteam.com>  Tue, 17 Dec 2013 14:47:50 +0100
+
+mesos (0.16.0-7) unstable; urgency=low
 
   * release 0.16
 
