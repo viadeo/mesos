@@ -2,6 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#ifndef __linux__
+#include <sys/time.h> // For gettimeofday.
+#endif
+
 #include <cstdlib> // For rand.
 #include <list>
 #include <set>
@@ -11,8 +15,10 @@
 #include <stout/foreach.hpp>
 #include <stout/gtest.hpp>
 #include <stout/hashset.hpp>
+#include <stout/numify.hpp>
 #include <stout/os.hpp>
 #include <stout/stopwatch.hpp>
+#include <stout/strings.hpp>
 #include <stout/try.hpp>
 #include <stout/uuid.hpp>
 
@@ -174,6 +180,30 @@ TEST_F(OsTest, find)
 }
 
 
+TEST_F(OsTest, bootId)
+{
+  Try<string> bootId = os::bootId();
+  ASSERT_SOME(bootId);
+  EXPECT_NE("", bootId.get());
+
+#ifdef __linux__
+  Try<string> read = os::read("/proc/sys/kernel/random/boot_id");
+  ASSERT_SOME(read);
+  EXPECT_EQ(bootId.get(), strings::trim(read.get()));
+#elif defined(__APPLE__)
+  // For OS X systems, the boot id is the system boot time in
+  // seconds, so assert it can be numified and is a reasonable value.
+  Try<uint64_t> numified = numify<uint64_t>(bootId.get());
+  ASSERT_SOME(numified);
+
+  timeval time;
+  gettimeofday(&time, NULL);
+  EXPECT_GT(Seconds(numified.get()), Seconds(0));
+  EXPECT_LT(Seconds(numified.get()), Seconds(time.tv_sec));
+#endif
+}
+
+
 TEST_F(OsTest, uname)
 {
   const Try<os::UTSInfo>& info = os::uname();
@@ -225,6 +255,7 @@ TEST_F(OsTest, sleep)
 #ifdef __APPLE__
 TEST_F(OsTest, sysctl)
 {
+  // String test.
   Try<os::UTSInfo> uname = os::uname();
 
   ASSERT_SOME(uname);
@@ -239,10 +270,12 @@ TEST_F(OsTest, sysctl)
   ASSERT_SOME(type);
   EXPECT_EQ(uname.get().sysname, type.get());
 
+  // Integer test.
   Try<int> maxproc = os::sysctl(CTL_KERN, KERN_MAXPROC).integer();
 
   ASSERT_SOME(maxproc);
 
+  // Table test.
   Try<std::vector<kinfo_proc> > processes =
     os::sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL).table(maxproc.get());
 
@@ -255,6 +288,16 @@ TEST_F(OsTest, sysctl)
   }
 
   EXPECT_EQ(1, pids.count(getpid()));
+
+  // Timeval test.
+  Try<timeval> bootTime = os::sysctl(CTL_KERN, KERN_BOOTTIME).time();
+  ASSERT_SOME(bootTime);
+
+  timeval time;
+  gettimeofday(&time, NULL);
+
+  EXPECT_GT(Seconds(bootTime.get().tv_sec), Seconds(0));
+  EXPECT_LT(Seconds(bootTime.get().tv_sec), Seconds(time.tv_sec));
 }
 #endif // __APPLE__
 
