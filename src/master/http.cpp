@@ -29,6 +29,7 @@
 
 #include <stout/foreach.hpp>
 #include <stout/json.hpp>
+#include <stout/memory.hpp>
 #include <stout/net.hpp>
 #include <stout/numify.hpp>
 #include <stout/os.hpp>
@@ -175,6 +176,9 @@ JSON::Object model(const Framework& framework)
   object.values["id"] = framework.id.value();
   object.values["name"] = framework.info.name();
   object.values["user"] = framework.info.user();
+  object.values["failover_timeout"] = framework.info.failover_timeout();
+  object.values["checkpoint"] = framework.info.checkpoint();
+  object.values["role"] = framework.info.role();
   object.values["registered_time"] = framework.registeredTime.secs();
   object.values["unregistered_time"] = framework.unregisteredTime.secs();
   object.values["active"] = framework.active;
@@ -198,8 +202,8 @@ JSON::Object model(const Framework& framework)
   // Model all of the completed tasks of a framework.
   {
     JSON::Array array;
-    foreach (const Task& task, framework.completedTasks) {
-      array.values.push_back(model(task));
+    foreach (const memory::shared_ptr<Task>& task, framework.completedTasks) {
+      array.values.push_back(model(*task));
     }
 
     object.values["completed_tasks"] = array;
@@ -447,7 +451,7 @@ Future<Response> Master::Http::state(const Request& request)
   {
     JSON::Array array;
 
-    foreach (const std::tr1::shared_ptr<Framework>& framework,
+    foreach (const memory::shared_ptr<Framework>& framework,
              master.completedFrameworks) {
       array.values.push_back(model(*framework));
     }
@@ -538,7 +542,7 @@ Future<Response> Master::Http::tasks(const Request& request)
   foreachvalue (Framework* framework, master.frameworks) {
     frameworks.push_back(framework);
   }
-  foreach (const std::tr1::shared_ptr<Framework>& framework,
+  foreach (const memory::shared_ptr<Framework>& framework,
            master.completedFrameworks) {
     frameworks.push_back(framework.get());
   }
@@ -550,8 +554,8 @@ Future<Response> Master::Http::tasks(const Request& request)
       CHECK_NOTNULL(task);
       tasks.push_back(task);
     }
-    foreach (const Task& task, framework->completedTasks) {
-      tasks.push_back(&task);
+    foreach (const memory::shared_ptr<Task>& task, framework->completedTasks) {
+      tasks.push_back(task.get());
     }
   }
 

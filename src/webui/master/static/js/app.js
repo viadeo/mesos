@@ -43,7 +43,6 @@
       //
       // [1] http://angular-ui.github.io/bootstrap/#/pagination
       paginationConfig.boundaryLinks = true;
-      paginationConfig.itemsPerPage = 50;
       paginationConfig.rotate = false;
 
       ZeroClipboard.setDefaults({
@@ -141,7 +140,7 @@
       return {
         restrict: 'A',
         scope: true,
-        template: '<i class="icon-file"></i>',
+        template: '<i class="glyphicon glyphicon-file"></i>',
 
         link: function(scope, element, attrs) {
           var clip = new ZeroClipboard(element[0]);
@@ -218,5 +217,105 @@
         },
         templateUrl: 'static/directives/timestamp.html'
       }
-    }]);
+    }])
+    .directive('mPagination', function() {
+      return { templateUrl: 'static/directives/pagination.html' }
+    })
+    .directive('mTableHeader', function() {
+      return { templateUrl: 'static/directives/tableHeader.html' }
+    })
+    .directive('mTable', ['$compile', '$filter', function($compile, $filter) {
+      /* This directive does not have a template. The DOM doesn't like
+       * having partially defined tables and so they don't work well with
+       * directives and templates. Because of this, the sub-elements that this
+       * includes are their own directive/templates and it adds them via. DOM
+       * manipulation here.
+       */
+      return {
+        scope: true,
+        link: function(scope, element, attrs) {
+          var defaultOrder = true;
+
+          _.extend(scope, {
+            originalData: [],
+            columnKey: '',
+            sortOrder: defaultOrder,
+            pgNum: 1,
+            pageLength: 50,
+            filterTerm: '',
+            headerTitle: attrs.title
+          })
+          // ---
+
+          // --- Allow sorting by column based on the <th> data-key attr
+          var th = element.find('th');
+          th.attr('ng-click', 'sortColumn($event)');
+          $compile(th)(scope);
+
+          var setSorting = function(el) {
+            var key = el.attr('data-key');
+
+            if (scope.columnKey === key) {
+              scope.sortOrder = !scope.sortOrder;
+            }
+            else { scope.sortOrder = defaultOrder }
+
+            scope.columnKey = key;
+
+            th.removeClass('descending ascending');
+            el.addClass(scope.sortOrder ? 'descending' : 'ascending');
+          };
+
+          var defaultSortColumn = function() {
+            var el = element.find('[data-sort]');
+            if (el.length === 0) {
+              el = element.find('th:first');
+            }
+            return el;
+          };
+
+          scope.sortColumn = function(ev) {
+            setSorting(angular.element(ev.target));
+          };
+
+          setSorting(defaultSortColumn());
+          // ---
+
+          scope.$watch(attrs.tableContent, function(data) {
+            if (!data) { scope.originalData = []; return };
+            if (angular.isObject(data)) { data = _.values(data) }
+
+            scope.originalData = data;
+          });
+
+          var setTableData = function() {
+            scope.filteredData = $filter('filter')(scope.originalData, scope.filterTerm)
+            scope.$data = $filter('orderBy')(
+              scope.filteredData,
+              scope.columnKey,
+              scope.sortOrder).slice(
+                (scope.pgNum - 1) * scope.pageLength,
+                scope.pgNum * scope.pageLength);
+          };
+
+          // Reset the page number for each new filtering.
+          scope.$watch('filterTerm', function() { scope.pgNum = 1; });
+
+          _.each(['originalData', 'columnKey', 'sortOrder', 'pgNum', 'filterTerm'],
+            function(k) { scope.$watch(k, setTableData); });
+
+          // --- Pagination controls
+          var el = angular.element('<div m-pagination></div>');
+          $compile(el)(scope);
+          element.after(el);
+          // ---
+
+          // --- Filtering
+          var el = angular.element('<div m-table-header></div>');
+          $compile(el)(scope);
+          element.before(el);
+          // ---
+        }
+      };
+     }]);
 })();

@@ -28,7 +28,7 @@
       <post>dev@mesos.apache.org</post>
       <archive>http://mail-archives.apache.org/mod_mbox/mesos-dev</archive>
       <otherArchives>
-        <otherArchive>http://mail-archives.apache.org/mod_mbox/incubator-mesos-dev</otherArchive>
+        <otherArchive>http://mail-archives.apache.org/mod_mbox/mesos-dev</otherArchive>
       </otherArchives>
     </mailingList>
   </mailingLists>
@@ -83,7 +83,7 @@
     <dependency>
       <artifactId>protobuf-java</artifactId>
       <groupId>com.google.protobuf</groupId>
-      <version>2.4.1</version>
+      <version>2.5.0</version>
     </dependency>
   </dependencies>
   <build>

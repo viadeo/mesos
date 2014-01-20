@@ -40,9 +40,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include <tr1/functional>
-#include <tr1/memory> // TODO(benh): Replace all shared_ptr with unique_ptr.
-
 #include <boost/shared_array.hpp>
 
 #include <process/clock.hpp>
@@ -68,10 +65,13 @@
 #include <stout/duration.hpp>
 #include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
+#include <stout/memory.hpp> // TODO(benh): Replace shared_ptr with unique_ptr.
 #include <stout/net.hpp>
+#include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/strings.hpp>
 #include <stout/thread.hpp>
+#include <stout/unreachable.hpp>
 
 #include "config.hpp"
 #include "decoder.hpp"
@@ -1847,6 +1847,8 @@ Socket SocketManager::accepted(int s)
   synchronized (this) {
     return sockets[s] = Socket(s);
   }
+
+  return UNREACHABLE(); // Quiet the compiler.
 }
 
 
@@ -3177,8 +3179,7 @@ void ProcessBase::visit(const HttpEvent& event)
   if (handlers.http.count(name) > 0) {
     // Create the promise to link with whatever gets returned, as well
     // as a future to wait for the response.
-    std::tr1::shared_ptr<Promise<Response> > promise(
-        new Promise<Response>());
+    memory::shared_ptr<Promise<Response> > promise(new Promise<Response>());
 
     Future<Response>* future = new Future<Response>(promise->future());
 
@@ -3420,7 +3421,7 @@ namespace internal {
 void read(int fd,
           void* data,
           size_t size,
-          const std::tr1::shared_ptr<Promise<size_t> >& promise,
+          const memory::shared_ptr<Promise<size_t> >& promise,
           const Future<short>& future)
 {
   // Ignore this function if the read operation has been cancelled.
@@ -3487,7 +3488,7 @@ Future<size_t> read(int fd, void* data, size_t size)
 {
   process::initialize();
 
-  std::tr1::shared_ptr<Promise<size_t> > promise(new Promise<size_t>());
+  memory::shared_ptr<Promise<size_t> > promise(new Promise<size_t>());
 
   // Check the file descriptor.
   Try<bool> nonblock = os::isNonblock(fd);
@@ -3522,23 +3523,23 @@ namespace internal {
 
 #if __cplusplus >= 201103L
 Future<string> _read(int fd,
-                     const std::tr1::shared_ptr<string>& buffer,
+                     const memory::shared_ptr<string>& buffer,
                      const boost::shared_array<char>& data,
                      size_t length)
 {
   return io::read(fd, data.get(), length)
-    .then([=] (size_t size) {
+    .then([=] (size_t size) -> Future<string> {
       if (size == 0) { // EOF.
         return string(*buffer);
       }
-      buffer->append(data, size);
+      buffer->append(data.get(), size);
       return _read(fd, buffer, data, length);
     });
 }
 #else
 // Forward declataion.
 Future<string> _read(int fd,
-                     const std::tr1::shared_ptr<string>& buffer,
+                     const memory::shared_ptr<string>& buffer,
                      const boost::shared_array<char>& data,
                      size_t length);
 
@@ -3547,7 +3548,7 @@ Future<string> __read(
     const size_t& size,
     // TODO(benh): Remove 'const &' after fixing libprocess.
     int fd,
-    const std::tr1::shared_ptr<string>& buffer,
+    const memory::shared_ptr<string>& buffer,
     const boost::shared_array<char>& data,
     size_t length)
 {
@@ -3562,14 +3563,14 @@ Future<string> __read(
 
 
 Future<string> _read(int fd,
-                     const std::tr1::shared_ptr<string>& buffer,
+                     const memory::shared_ptr<string>& buffer,
                      const boost::shared_array<char>& data,
                      size_t length)
 {
   return io::read(fd, data.get(), length)
     .then(lambda::bind(&__read, lambda::_1, fd, buffer, data, length));
 }
-#endif
+#endif // __cplusplus >= 201103L
 
 } // namespace internal
 
@@ -3580,7 +3581,7 @@ Future<string> read(int fd)
 
   // TODO(benh): Wrap up this data as a struct, use 'Owner'.
   // TODO(bmahler): For efficiency, use a rope for the buffer.
-  std::tr1::shared_ptr<string> buffer(new string());
+  memory::shared_ptr<string> buffer(new string());
   boost::shared_array<char> data(new char[BUFFERED_READ_SIZE]);
 
   return internal::_read(fd, buffer, data, BUFFERED_READ_SIZE);
@@ -3616,10 +3617,14 @@ Future<Response> decode(const string& buffer)
   return response;
 }
 
-} // namespace internal {
 
-
-Future<Response> get(const UPID& upid, const string& path, const string& query)
+Future<Response> request(
+    const UPID& upid,
+    const string& method,
+    const string& path,
+    const Option<string>& query,
+    const Option<string>& contentType,
+    const Option<string>& body)
 {
   int s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
 
@@ -3645,19 +3650,30 @@ Future<Response> get(const UPID& upid, const string& path, const string& query)
 
   std::ostringstream out;
 
-  if (query.empty()) {
-    out << "GET /" << upid.id << "/" << path << " HTTP/1.1\r\n";
-  } else {
-    out << "GET /" << upid.id << "/" << path << "?" << query << " HTTP/1.1\r\n";
+  out << method << " /" << upid.id << "/" << path;
+  if (query.isSome()) {
+    out << "?" << query.get();
   }
+  out << " HTTP/1.1\r\n";
 
   // Call inet_ntop since inet_ntoa is not thread-safe!
   char ip[INET_ADDRSTRLEN];
   PCHECK(inet_ntop(AF_INET, (in_addr *) &upid.ip, ip, INET_ADDRSTRLEN) != NULL);
 
   out << "Host: " << ip << ":" << upid.port << "\r\n"
-      << "Connection: close\r\n"
-      << "\r\n";
+      << "Connection: close\r\n";
+
+  if (contentType.isSome()) {
+    out << "Content-Type: " << contentType.get() << "\r\n";
+  }
+
+  if (body.isNone()) {
+    out << "\r\n";
+  } else {
+    out << "Content-Length: " << body.get().length() << "\r\n"
+        << "\r\n"
+        << body.get();
+  }
 
   // TODO(bmahler): Use benh's async write when it gets committed.
   const string& data = out.str();
@@ -3689,13 +3705,35 @@ Future<Response> get(const UPID& upid, const string& path, const string& query)
     .onAny(lambda::bind(&os::close, s));
 }
 
+} // namespace internal {
+
+
+Future<Response> get(const UPID& upid, const string& path, const Option<string>& query)
+{
+  return internal::request(upid, "GET", path, query, None(), None());
+}
+
+
+// Overload for back-compat.
+Future<Response> get(const UPID& upid, const string& path, const string& query)
+{
+   //In this overload empty string means no query.
+   return get(upid, path, query.empty() ? Option<string>::none() : Some(query));
+}
+
+
+Future<Response> post(const UPID& upid, const string& path, const string& contentType, const string& body)
+{
+  return internal::request(upid, "POST", path, None(), contentType, body);
+}
+
 }  // namespace http {
 
 namespace internal {
 
 void dispatch(
     const UPID& pid,
-    const std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> >& f,
+    const memory::shared_ptr<lambda::function<void(ProcessBase*)> >& f,
     const string& method)
 {
   process::initialize();

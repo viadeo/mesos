@@ -218,8 +218,8 @@ JSON::Object model(const Executor& executor)
   object.values["queued_tasks"] = queued;
 
   JSON::Array completed;
-  foreach (const Task& task, executor.completedTasks) {
-    completed.values.push_back(model(task));
+  foreach (const memory::shared_ptr<Task>& task, executor.completedTasks) {
+    completed.values.push_back(model(*task));
   }
 
   // NOTE: We add 'terminatedTasks' to 'completed_tasks' for
@@ -242,6 +242,9 @@ JSON::Object model(const Framework& framework)
   object.values["id"] = framework.id.value();
   object.values["name"] = framework.info.name();
   object.values["user"] = framework.info.user();
+  object.values["failover_timeout"] = framework.info.failover_timeout();
+  object.values["checkpoint"] = framework.info.checkpoint();
+  object.values["role"] = framework.info.role();
 
   JSON::Array executors;
   foreachvalue (Executor* executor, framework.executors) {

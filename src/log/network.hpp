@@ -22,6 +22,7 @@
 // TODO(benh): Eventually move and associate this code with the
 // libprocess protobuf code rather than keep it here.
 
+#include <list>
 #include <set>
 #include <string>
 
@@ -33,6 +34,7 @@
 #include <stout/duration.hpp>
 #include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
+#include <stout/nothing.hpp>
 
 #include "logging/logging.hpp"
 
@@ -48,6 +50,16 @@ class NetworkProcess;
 class Network
 {
 public:
+  enum WatchMode
+  {
+    EQUAL_TO,
+    NOT_EQUAL_TO,
+    LESS_THAN,
+    LESS_THAN_OR_EQUAL_TO,
+    GREATER_THAN,
+    GREATER_THAN_OR_EQUAL_TO
+  };
+
   Network();
   Network(const std::set<process::UPID>& pids);
   virtual ~Network();
@@ -61,19 +73,28 @@ public:
   // Set the PIDs that are part of this network.
   void set(const std::set<process::UPID>& pids);
 
+  // Returns a future which gets set when the network size satisfies
+  // the constraint specified by 'size' and 'mode'. For example, if
+  // 'size' is 2 and 'mode' is GREATER_THAN, then the returned future
+  // will get set when the size of the network is greater than 2.
+  process::Future<size_t> watch(
+      size_t size,
+      WatchMode mode = NOT_EQUAL_TO) const;
+
   // Sends a request to each member of the network and returns a set
   // of futures that represent their responses.
   template <typename Req, typename Res>
   process::Future<std::set<process::Future<Res> > > broadcast(
       const Protocol<Req, Res>& protocol,
       const Req& req,
-      const std::set<process::UPID>& filter = std::set<process::UPID>());
+      const std::set<process::UPID>& filter = std::set<process::UPID>()) const;
 
-  // Sends a message to each member of the network.
+  // Sends a message to each member of the network. The returned
+  // future is set when the message is broadcasted.
   template <typename M>
-  void broadcast(
+  process::Future<Nothing> broadcast(
       const M& m,
-      const std::set<process::UPID>& filter = std::set<process::UPID>());
+      const std::set<process::UPID>& filter = std::set<process::UPID>()) const;
 
 private:
   // Not copyable, not assignable.
@@ -87,10 +108,18 @@ private:
 class ZooKeeperNetwork : public Network
 {
 public:
-  ZooKeeperNetwork(zookeeper::Group* group);
+  ZooKeeperNetwork(
+      const std::string& servers,
+      const Duration& timeout,
+      const std::string& znode,
+      const Option<zookeeper::Authentication>& auth);
 
 private:
   typedef ZooKeeperNetwork This;
+
+  // Not copyable, not assignable.
+  ZooKeeperNetwork(const ZooKeeperNetwork&);
+  ZooKeeperNetwork& operator = (const ZooKeeperNetwork&);
 
   // Helper that sets up a watch on the group.
   void watch(const std::set<zookeeper::Group::Membership>& expected);
@@ -101,9 +130,13 @@ private:
   // Invoked when group members data has been collected.
   void collected(const process::Future<std::list<std::string> >& datas);
 
-  zookeeper::Group* group;
-  process::Executor executor;
+  zookeeper::Group group;
   process::Future<std::set<zookeeper::Group::Membership> > memberships;
+
+  // NOTE: The declaration order here is important. We want to delete
+  // the 'executor' before we delete the 'group' so that we don't get
+  // spurious fatal errors when the 'group' is being deleted.
+  process::Executor executor;
 };
 
 
@@ -121,12 +154,18 @@ public:
   {
     link(pid); // Try and keep a socket open (more efficient).
     pids.insert(pid);
+
+    // Update any pending watches.
+    update();
   }
 
   void remove(const process::UPID& pid)
   {
     // TODO(benh): unlink(pid);
     pids.erase(pid);
+
+    // Update any pending watches.
+    update();
   }
 
   void set(const std::set<process::UPID>& _pids)
@@ -135,6 +174,23 @@ public:
     foreach (const process::UPID& pid, _pids) {
       add(pid); // Also does a link.
     }
+
+    // Update any pending watches.
+    update();
+  }
+
+  process::Future<size_t> watch(size_t size, Network::WatchMode mode)
+  {
+    if (satisfied(size, mode)) {
+      return pids.size();
+    }
+
+    Watch* watch = new Watch(size, mode);
+    watches.push_back(watch);
+
+    // TODO(jieyu): Consider deleting 'watch' if the returned future
+    // is discarded by the user.
+    return watch->promise.future();
   }
 
   // Sends a request to each of the groups members and returns a set
@@ -157,7 +213,7 @@ public:
   }
 
   template <typename M>
-  void broadcast(
+  Nothing broadcast(
       const M& m,
       const std::set<process::UPID>& filter)
   {
@@ -168,14 +224,76 @@ public:
         process::post(pid, m);
       }
     }
+    return Nothing();
+  }
+
+protected:
+  virtual void finalize()
+  {
+    foreach (Watch* watch, watches) {
+      watch->promise.fail("Network is being terminated");
+      delete watch;
+    }
+    watches.clear();
   }
 
 private:
+  struct Watch
+  {
+    Watch(size_t _size, Network::WatchMode _mode)
+      : size(_size), mode(_mode) {}
+
+    size_t size;
+    Network::WatchMode mode;
+    process::Promise<size_t> promise;
+  };
+
   // Not copyable, not assignable.
   NetworkProcess(const NetworkProcess&);
   NetworkProcess& operator = (const NetworkProcess&);
 
+  // Notifies the change of the network.
+  void update()
+  {
+    const size_t size = watches.size();
+    for (size_t i = 0; i < size; i++) {
+      Watch* watch = watches.front();
+      watches.pop_front();
+
+      if (satisfied(watch->size, watch->mode)) {
+        watch->promise.set(pids.size());
+        delete watch;
+      } else {
+        watches.push_back(watch);
+      }
+    }
+  }
+
+  // Returns true if the current size of the network satisfies the
+  // constraint specified by 'size' and 'mode'.
+  bool satisfied(size_t size, Network::WatchMode mode)
+  {
+    switch (mode) {
+      case Network::EQUAL_TO:
+        return pids.size() == size;
+      case Network::NOT_EQUAL_TO:
+        return pids.size() != size;
+      case Network::LESS_THAN:
+        return pids.size() < size;
+      case Network::LESS_THAN_OR_EQUAL_TO:
+        return pids.size() <= size;
+      case Network::GREATER_THAN:
+        return pids.size() > size;
+      case Network::GREATER_THAN_OR_EQUAL_TO:
+        return pids.size() >= size;
+      default:
+        LOG(FATAL) << "Invalid watch mode";
+        break;
+    }
+  }
+
   std::set<process::UPID> pids;
+  std::list<Watch*> watches;
 };
 
 
@@ -219,11 +337,18 @@ inline void Network::set(const std::set<process::UPID>& pids)
 }
 
 
+inline process::Future<size_t> Network::watch(
+    size_t size, Network::WatchMode mode) const
+{
+  return process::dispatch(process, &NetworkProcess::watch, size, mode);
+}
+
+
 template <typename Req, typename Res>
 process::Future<std::set<process::Future<Res> > > Network::broadcast(
     const Protocol<Req, Res>& protocol,
     const Req& req,
-    const std::set<process::UPID>& filter)
+    const std::set<process::UPID>& filter) const
 {
   return process::dispatch(process, &NetworkProcess::broadcast<Req, Res>,
                            protocol, req, filter);
@@ -231,20 +356,24 @@ process::Future<std::set<process::Future<Res> > > Network::broadcast(
 
 
 template <typename M>
-void Network::broadcast(
+process::Future<Nothing> Network::broadcast(
     const M& m,
-    const std::set<process::UPID>& filter)
+    const std::set<process::UPID>& filter) const
 {
   // Need to disambiguate overloaded function.
-  void (NetworkProcess::*broadcast)(const M&, const std::set<process::UPID>&) =
-    &NetworkProcess::broadcast<M>;
+  Nothing (NetworkProcess::*broadcast)(const M&, const std::set<process::UPID>&)
+    = &NetworkProcess::broadcast<M>;
 
-  process::dispatch(process, broadcast, m, filter);
+  return process::dispatch(process, broadcast, m, filter);
 }
 
 
-inline ZooKeeperNetwork::ZooKeeperNetwork(zookeeper::Group* _group)
-  : group(_group)
+inline ZooKeeperNetwork::ZooKeeperNetwork(
+    const std::string& servers,
+    const Duration& timeout,
+    const std::string& znode,
+    const Option<zookeeper::Authentication>& auth)
+  : group(servers, timeout, znode, auth)
 {
   watch(std::set<zookeeper::Group::Membership>());
 }
@@ -253,7 +382,7 @@ inline ZooKeeperNetwork::ZooKeeperNetwork(zookeeper::Group* _group)
 inline void ZooKeeperNetwork::watch(
     const std::set<zookeeper::Group::Membership>& expected)
 {
-  memberships = group->watch(expected);
+  memberships = group.watch(expected);
   memberships
     .onAny(executor.defer(lambda::bind(&This::watched, this, lambda::_1)));
 }
@@ -264,7 +393,7 @@ inline void ZooKeeperNetwork::watched(
 {
   if (memberships.isFailed()) {
     // We can't do much here, we could try creating another Group but
-    // that might just continue indifinitely, so we fail early
+    // that might just continue indefinitely, so we fail early
     // instead. Note that Group handles all retryable/recoverable
     // ZooKeeper errors internally.
     LOG(FATAL) << "Failed to watch ZooKeeper group: " << memberships.failure();
@@ -278,7 +407,7 @@ inline void ZooKeeperNetwork::watched(
   std::list<process::Future<std::string> > futures;
 
   foreach (const zookeeper::Group::Membership& membership, memberships.get()) {
-    futures.push_back(group->data(membership));
+    futures.push_back(group.data(membership));
   }
 
   process::collect(futures, process::Timeout::in(Seconds(5)))

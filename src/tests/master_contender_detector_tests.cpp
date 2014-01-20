@@ -213,6 +213,58 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterContender)
 }
 
 
+// Verifies that contender does not recontend if the current election
+// is still pending.
+TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderPendingElection)
+{
+  Try<zookeeper::URL> url = zookeeper::URL::parse(
+      "zk://" + server->connectString() + "/mesos");
+
+  ASSERT_SOME(url);
+
+  ZooKeeperMasterContender contender(url.get());
+
+  PID<Master> master;
+  master.ip = 10000000;
+  master.port = 10000;
+
+  contender.initialize(master);
+
+  // Drop Group::join so that 'contended' will stay pending.
+  Future<Nothing> join = DROP_DISPATCH(_, &GroupProcess::join);
+
+  Future<Future<Nothing> > contended = contender.contend();
+  AWAIT_READY(join);
+
+  Clock::pause();
+
+  // Make sure GroupProcess::join is dispatched (and dropped).
+  Clock::settle();
+
+  EXPECT_TRUE(contended.isPending());
+
+  process::filter(NULL);
+
+  process::TestsFilter* filter =
+    process::FilterTestEventListener::instance()->install();
+  pthread_mutex_lock(&filter->mutex);
+
+  // Expect GroupProcess::join not getting called because
+  // ZooKeeperMasterContender directly returns.
+  EXPECT_CALL(filter->mock, filter(testing::A<const process::DispatchEvent&>()))
+    .With(DispatchMatcher(_, &GroupProcess::join))
+    .Times(0);
+  pthread_mutex_lock(&filter->mutex);
+
+  // Recontend and settle so that if ZooKeeperMasterContender is not
+  // directly returning, GroupProcess::join is dispatched.
+  contender.contend();
+  Clock::settle();
+
+  Clock::resume();
+}
+
+
 // Two contenders, the first wins. Kill the first, then the second
 // is elected.
 TEST_F(ZooKeeperMasterContenderDetectorTest, MasterContenders)
@@ -296,6 +348,9 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, NonRetryableFrrors)
   // Fails due to authentication error.
   AWAIT_FAILED(contender.contend());
 
+  // Subsequent call should also fail.
+  AWAIT_FAILED(contender.contend());
+
   // Now test non-retryable failures in detection.
   ZooKeeperTest::TestWatcher watcher;
   ZooKeeper authenticatedZk(server->connectString(), NO_TIMEOUT, &watcher);
@@ -320,6 +375,9 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, NonRetryableFrrors)
       None()));
 
   ZooKeeperMasterDetector detector(group3);
+  AWAIT_FAILED(detector.detect());
+
+  // Subsequent call should also fail.
   AWAIT_FAILED(detector.detect());
 }
 

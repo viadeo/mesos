@@ -49,7 +49,10 @@ class ZooKeeperMasterContenderProcess
 public:
   ZooKeeperMasterContenderProcess(const zookeeper::URL& url);
   ZooKeeperMasterContenderProcess(Owned<zookeeper::Group> group);
-  ~ZooKeeperMasterContenderProcess();
+  virtual ~ZooKeeperMasterContenderProcess();
+
+  // Explicitely use 'initialize' since we're overloading below.
+  using process::ProcessBase::initialize;
 
   void initialize(const PID<Master>& master);
 
@@ -59,7 +62,10 @@ public:
 private:
   Owned<zookeeper::Group> group;
   LeaderContender* contender;
-  PID<Master> master;
+
+  // The master this contender contends on behalf of.
+  Option<PID<Master> > master;
+  Option<Future<Future<Nothing> > > candidacy;
 };
 
 
@@ -112,9 +118,12 @@ void StandaloneMasterContender::initialize(
   initialized = true;
 }
 
+
 Future<Future<Nothing> > StandaloneMasterContender::contend()
 {
-  CHECK(initialized) << "Initialize the contender first";
+  if (!initialized) {
+    return Failure("Initialize the contender first");
+  }
 
   if (promise != NULL) {
     LOG(INFO) << "Withdrawing the previous membership before recontending";
@@ -191,15 +200,23 @@ void ZooKeeperMasterContenderProcess::initialize(
 
 Future<Future<Nothing> > ZooKeeperMasterContenderProcess::contend()
 {
-  CHECK(master) << "Initialize the contender first";
+  if (master.isNone()) {
+    return Failure("Initialize the contender first");
+  }
+
+  // Should not recontend if the last election is still ongoing.
+  if (candidacy.isSome() && candidacy.get().isPending()) {
+    return candidacy.get();
+  }
 
   if (contender != NULL) {
     LOG(INFO) << "Withdrawing the previous membership before recontending";
     delete contender;
   }
 
-  contender = new LeaderContender(group.get(), master);
-  return contender->contend();
+  contender = new LeaderContender(group.get(), master.get());
+  candidacy = contender->contend();
+  return candidacy.get();
 }
 
 } // namespace internal {

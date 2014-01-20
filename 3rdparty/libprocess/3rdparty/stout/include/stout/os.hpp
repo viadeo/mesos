@@ -1,3 +1,16 @@
+/**
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #ifndef __STOUT_OS_HPP__
 #define __STOUT_OS_HPP__
 
@@ -858,46 +871,47 @@ inline Try<Load> loadavg()
 }
 
 
-// Returns the total size of main memory.
-inline Try<Bytes> memory()
+// Structure returned by memory() containing the total size of main
+// and free memory.
+struct Memory
 {
+  Bytes total;
+  Bytes free;
+};
+
+
+// Returns the total size of main and free memory.
+inline Try<Memory> memory()
+{
+  Memory memory;
+
 #ifdef __linux__
   struct sysinfo info;
   if (sysinfo(&info) != 0) {
     return ErrnoError();
   }
+
 # if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 3, 23)
-  return Bytes(info.totalram * info.mem_unit);
+  memory.total = Bytes(info.totalram * info.mem_unit);
+  memory.free = Bytes(info.freeram * info.mem_unit);
 # else
-  return Bytes(info.totalram);
+  memory.total = Bytes(info.totalram);
+  memory.free = Bytes(info.freeram);
 # endif
+
+  return memory;
+
 #elif defined __APPLE__
-  const Try<int64_t>& memory =
+  const Try<int64_t>& totalMemory =
     os::sysctl(CTL_HW, HW_MEMSIZE).integer();
 
-  if (memory.isError()) {
-    return Error(memory.error());
+  if (totalMemory.isError()) {
+    return Error(totalMemory.error());
   }
-  return Bytes(memory.get());
-#else
-  return Error("Cannot determine the size of main memory");
-#endif
-}
+  memory.total = Bytes(totalMemory.get());
 
-
-inline Try<Bytes> freeMemory()
-{
-#ifdef __linux__
-  struct sysinfo info;
-  if (sysinfo(&info) != 0) {
-    return ErrnoError();
-  }
-# if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 3, 23)
-  return Bytes(info.freeram * info.mem_unit);
-# else
-  return Bytes(info.freeram);
-# endif
-#elif defined __APPLE__
+  // Size of free memory is available in terms of number of
+  // free pages on Mac OS X.
   const long pageSize = sysconf(_SC_PAGESIZE);
   if (pageSize < 0) {
     return ErrnoError();
@@ -914,10 +928,12 @@ inline Try<Bytes> freeMemory()
       0) != 0) {
     return ErrnoError();
   }
+  memory.free = Bytes(freeCount * pageSize);
 
-  return Bytes(freeCount * pageSize);
+  return memory;
+
 #else
-  return Error("Cannot determine the size of free memory");
+  return Error("Cannot determine the size of total and free memory");
 #endif
 }
 

@@ -23,8 +23,6 @@
 #include <string>
 #include <vector>
 
-#include <tr1/functional>
-
 #include <boost/circular_buffer.hpp>
 
 #include <mesos/resources.hpp>
@@ -37,6 +35,7 @@
 #include <stout/foreach.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
+#include <stout/memory.hpp>
 #include <stout/multihashmap.hpp>
 #include <stout/option.hpp>
 
@@ -174,6 +173,10 @@ public:
       const process::UPID& from,
       const process::UPID& pid);
 
+  // Invoked when there is a newly elected leading master.
+  // Made public for testing purposes.
+  void detected(const Future<Option<UPID> >& pid);
+
 protected:
   virtual void initialize();
   virtual void finalize();
@@ -200,9 +203,6 @@ protected:
 
   // Invoked when the contender has lost the candidacy.
   void lostCandidacy(const Future<Nothing>& lost);
-
-  // Invoked when there is a newly elected leading master.
-  void detected(const Future<Option<UPID> >& pid);
 
   // Process a launch tasks request (for a non-cancelled offer) by
   // launching the desired tasks (if the offer contains a valid set of
@@ -355,7 +355,7 @@ private:
   // Authenticated frameworks keyed by framework's PID.
   hashset<UPID> authenticated;
 
-  boost::circular_buffer<std::tr1::shared_ptr<Framework> > completedFrameworks;
+  boost::circular_buffer<memory::shared_ptr<Framework> > completedFrameworks;
 
   int64_t nextFrameworkId; // Used to give each framework a unique ID.
   int64_t nextOfferId;     // Used to give each slot offer a unique ID.
@@ -566,7 +566,7 @@ struct Framework
       << "Unknown task " << task->task_id()
       << " of framework " << task->framework_id();
 
-    completedTasks.push_back(*task);
+    completedTasks.push_back(memory::shared_ptr<Task>(new Task(*task)));
     tasks.erase(task->task_id());
     resources -= task->resources();
   }
@@ -634,7 +634,10 @@ struct Framework
 
   hashmap<TaskID, Task*> tasks;
 
-  boost::circular_buffer<Task> completedTasks;
+  // NOTE: We use a shared pointer for Task because clang doesn't like
+  // Boost's implementation of circular_buffer with Task (Boost
+  // attempts to do some memset's which are unsafe).
+  boost::circular_buffer<memory::shared_ptr<Task> > completedTasks;
 
   hashset<Offer*> offers; // Active offers for framework.
 

@@ -28,6 +28,7 @@
 
 #include <stout/check.hpp>
 #include <stout/lambda.hpp>
+#include <stout/memory.hpp>
 #include <stout/multihashmap.hpp>
 #include <stout/nothing.hpp>
 #include <stout/os.hpp>
@@ -54,7 +55,7 @@ using std::vector;
 
 using process::wait; // Necessary on some OS's to disambiguate.
 
-using std::tr1::shared_ptr;
+using memory::shared_ptr;
 
 namespace mesos {
 namespace internal {
@@ -670,7 +671,7 @@ void Master::fileAttached(const Future<Nothing>& result, const string& path)
     LOG(INFO) << "Successfully attached file '" << path << "'";
   } else {
     LOG(ERROR) << "Failed to attach file '" << path << "': "
-               << result.isFailed() ? result.failure() : "discarded";
+               << (result.isFailed() ? result.failure() : "discarded");
   }
 }
 
@@ -2540,7 +2541,7 @@ void Master::removeFramework(Framework* framework)
   framework->unregisteredTime = Clock::now();
 
   // The completedFramework buffer now owns the framework pointer.
-  completedFrameworks.push_back(std::tr1::shared_ptr<Framework>(framework));
+  completedFrameworks.push_back(shared_ptr<Framework>(framework));
 
   CHECK(roles.contains(framework->info.role()))
     << "Unknown role " << framework->info.role()

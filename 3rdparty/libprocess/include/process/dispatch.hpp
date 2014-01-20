@@ -1,13 +1,15 @@
+#if __cplusplus >= 201103L
+#include <process/c++11/dispatch.hpp>
+#else
 #ifndef __PROCESS_DISPATCH_HPP__
 #define __PROCESS_DISPATCH_HPP__
 
 #include <string>
 
-#include <tr1/functional>
-#include <tr1/memory> // TODO(benh): Replace all shared_ptr with unique_ptr.
-
 #include <process/process.hpp>
 
+#include <stout/lambda.hpp>
+#include <stout/memory.hpp> // TODO(benh): Replace shared_ptr with unique_ptr.
 #include <stout/preprocessor.hpp>
 
 namespace process {
@@ -51,7 +53,7 @@ namespace internal {
 // will probably change in the future to unique_ptr (or a variant).
 void dispatch(
     const UPID& pid,
-    const std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> >& f,
+    const memory::shared_ptr<lambda::function<void(ProcessBase*)> >& f,
     const std::string& method = std::string());
 
 // For each return type (void, future, value) there is a dispatcher
@@ -65,7 +67,7 @@ void dispatch(
 template <typename T>
 void vdispatcher(
     ProcessBase* process,
-    std::tr1::shared_ptr<std::tr1::function<void(T*)> > thunk)
+    memory::shared_ptr<lambda::function<void(T*)> > thunk)
 {
   assert(process != NULL);
   T* t = dynamic_cast<T*>(process);
@@ -77,8 +79,8 @@ void vdispatcher(
 template <typename R, typename T>
 void pdispatcher(
     ProcessBase* process,
-    std::tr1::shared_ptr<std::tr1::function<Future<R>(T*)> > thunk,
-    std::tr1::shared_ptr<Promise<R> > promise)
+    memory::shared_ptr<lambda::function<Future<R>(T*)> > thunk,
+    memory::shared_ptr<Promise<R> > promise)
 {
   assert(process != NULL);
   T* t = dynamic_cast<T*>(process);
@@ -90,8 +92,8 @@ void pdispatcher(
 template <typename R, typename T>
 void rdispatcher(
     ProcessBase* process,
-    std::tr1::shared_ptr<std::tr1::function<R(T*)> > thunk,
-    std::tr1::shared_ptr<Promise<R> > promise)
+    memory::shared_ptr<lambda::function<R(T*)> > thunk,
+    memory::shared_ptr<Promise<R> > promise)
 {
   assert(process != NULL);
   T* t = dynamic_cast<T*>(process);
@@ -125,17 +127,17 @@ std::string canonicalize(Method method)
 //     void (T::*method)(P...),
 //     P... p)
 // {
-//   std::tr1::shared_ptr<std::tr1::function<void(T*)> > thunk(
-//       new std::tr1::function<void(T*)>(
-//           std::tr1::bind(method,
-//                          std::tr1::placeholders::_1,
-//                          std::forward<P>(p)...)));
+//   memory::shared_ptr<lambda::function<void(T*)> > thunk(
+//       new lambda::function<void(T*)>(
+//           lambda::bind(method,
+//                        lambda::_1,
+//                        std::forward<P>(p)...)));
 //
-//   std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher(
-//       new std::tr1::function<void(ProcessBase*)>(
-//           std::tr1::bind(&internal::vdispatcher<T>,
-//                          std::tr1::placeholders::_1,
-//                          thunk)));
+//   memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher(
+//       new lambda::function<void(ProcessBase*)>(
+//           lambda::bind(&internal::vdispatcher<T>,
+//                        lambda::_1,
+//                        thunk)));
 //
 //   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
 // }
@@ -145,15 +147,15 @@ void dispatch(
     const PID<T>& pid,
     void (T::*method)(void))
 {
-  std::tr1::shared_ptr<std::tr1::function<void(T*)> > thunk(
-      new std::tr1::function<void(T*)>(
-          std::tr1::bind(method, std::tr1::placeholders::_1)));
+  memory::shared_ptr<lambda::function<void(T*)> > thunk(
+      new lambda::function<void(T*)>(
+          lambda::bind(method, lambda::_1)));
 
-  std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher(
-      new std::tr1::function<void(ProcessBase*)>(
-          std::tr1::bind(&internal::vdispatcher<T>,
-                         std::tr1::placeholders::_1,
-                         thunk)));
+  memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher(
+      new lambda::function<void(ProcessBase*)>(
+          lambda::bind(&internal::vdispatcher<T>,
+                       lambda::_1,
+                       thunk)));
 
   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
 }
@@ -183,17 +185,17 @@ void dispatch(
       void (T::*method)(ENUM_PARAMS(N, P)),                             \
       ENUM_BINARY_PARAMS(N, A, a))                                      \
   {                                                                     \
-    std::tr1::shared_ptr<std::tr1::function<void(T*)> > thunk(          \
-        new std::tr1::function<void(T*)>(                               \
-            std::tr1::bind(method,                                      \
-                           std::tr1::placeholders::_1,                  \
-                           ENUM_PARAMS(N, a))));                        \
+    memory::shared_ptr<lambda::function<void(T*)> > thunk(              \
+        new lambda::function<void(T*)>(                                 \
+            lambda::bind(method,                                        \
+                         lambda::_1,                                    \
+                         ENUM_PARAMS(N, a))));                          \
                                                                         \
-    std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher( \
-        new std::tr1::function<void(ProcessBase*)>(                     \
-            std::tr1::bind(&internal::vdispatcher<T>,                   \
-                           std::tr1::placeholders::_1,                  \
-                           thunk)));                                    \
+    memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher( \
+        new lambda::function<void(ProcessBase*)>(                       \
+            lambda::bind(&internal::vdispatcher<T>,                     \
+                         lambda::_1,                                    \
+                         thunk)));                                      \
                                                                         \
     internal::dispatch(pid, dispatcher, internal::canonicalize(method)); \
   }                                                                     \
@@ -232,20 +234,20 @@ void dispatch(
 //     Future<R> (T::*method)(P...),
 //     P... p)
 // {
-//   std::tr1::shared_ptr<std::tr1::function<Future<R>(T*)> > thunk(
-//       new std::tr1::function<Future<R>(T*)>(
-//           std::tr1::bind(method,
-//                          std::tr1::placeholders::_1,
-//                          std::forward<P>(p)...)));
+//   memory::shared_ptr<lambda::function<Future<R>(T*)> > thunk(
+//       new lambda::function<Future<R>(T*)>(
+//           lambda::bind(method,
+//                        lambda::_1,
+//                        std::forward<P>(p)...)));
 //
-//   std::tr1::shared_ptr<Promise<R> > promise(new Promise<R>());
+//   memory::shared_ptr<Promise<R> > promise(new Promise<R>());
 //   Future<R> future = promise->future();
 //
-//   std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher(
-//       new std::tr1::function<void(ProcessBase*)>(
-//           std::tr1::bind(&internal::pdispatcher<R, T>,
-//                          std::tr1::placeholders::_1,
-//                          thunk, promise)));
+//   memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher(
+//       new lambda::function<void(ProcessBase*)>(
+//           lambda::bind(&internal::pdispatcher<R, T>,
+//                        lambda::_1,
+//                        thunk, promise)));
 //
 //   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
 //
@@ -257,18 +259,18 @@ Future<R> dispatch(
     const PID<T>& pid,
     Future<R> (T::*method)(void))
 {
-  std::tr1::shared_ptr<std::tr1::function<Future<R>(T*)> > thunk(
-      new std::tr1::function<Future<R>(T*)>(
-          std::tr1::bind(method, std::tr1::placeholders::_1)));
+  memory::shared_ptr<lambda::function<Future<R>(T*)> > thunk(
+      new lambda::function<Future<R>(T*)>(
+          lambda::bind(method, lambda::_1)));
 
-  std::tr1::shared_ptr<Promise<R> > promise(new Promise<R>());
+  memory::shared_ptr<Promise<R> > promise(new Promise<R>());
   Future<R> future = promise->future();
 
-  std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher(
-      new std::tr1::function<void(ProcessBase*)>(
-          std::tr1::bind(&internal::pdispatcher<R, T>,
-                         std::tr1::placeholders::_1,
-                         thunk, promise)));
+  memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher(
+      new lambda::function<void(ProcessBase*)>(
+          lambda::bind(&internal::pdispatcher<R, T>,
+                       lambda::_1,
+                       thunk, promise)));
 
   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
 
@@ -301,20 +303,20 @@ Future<R> dispatch(
       Future<R> (T::*method)(ENUM_PARAMS(N, P)),                        \
       ENUM_BINARY_PARAMS(N, A, a))                                      \
   {                                                                     \
-    std::tr1::shared_ptr<std::tr1::function<Future<R>(T*)> > thunk(     \
-        new std::tr1::function<Future<R>(T*)>(                          \
-            std::tr1::bind(method,                                      \
-                           std::tr1::placeholders::_1,                  \
-                           ENUM_PARAMS(N, a))));                        \
+    memory::shared_ptr<lambda::function<Future<R>(T*)> > thunk(         \
+        new lambda::function<Future<R>(T*)>(                            \
+            lambda::bind(method,                                        \
+                         lambda::_1,                                    \
+                         ENUM_PARAMS(N, a))));                          \
                                                                         \
-    std::tr1::shared_ptr<Promise<R> > promise(new Promise<R>());        \
+    memory::shared_ptr<Promise<R> > promise(new Promise<R>());          \
     Future<R> future = promise->future();                               \
                                                                         \
-    std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher( \
-        new std::tr1::function<void(ProcessBase*)>(                     \
-            std::tr1::bind(&internal::pdispatcher<R, T>,                \
-                           std::tr1::placeholders::_1,                  \
-                           thunk, promise)));                           \
+    memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher( \
+        new lambda::function<void(ProcessBase*)>(                       \
+            lambda::bind(&internal::pdispatcher<R, T>,                  \
+                         lambda::_1,                                    \
+                         thunk, promise)));                             \
                                                                         \
     internal::dispatch(pid, dispatcher, internal::canonicalize(method)); \
                                                                         \
@@ -357,20 +359,20 @@ Future<R> dispatch(
 //     R (T::*method)(P...),
 //     P... p)
 // {
-//   std::tr1::shared_ptr<std::tr1::function<R(T*)> > thunk(
-//       new std::tr1::function<R(T*)>(
-//           std::tr1::bind(method,
-//                          std::tr1::placeholders::_1,
-//                          std::forward<P>(p)...)));
+//   memory::shared_ptr<lambda::function<R(T*)> > thunk(
+//       new lambda::function<R(T*)>(
+//           lambda::bind(method,
+//                        lambda::_1,
+//                        std::forward<P>(p)...)));
 //
-//   std::tr1::shared_ptr<Promise<R> > promise(new Promise<R>());
+//   memory::shared_ptr<Promise<R> > promise(new Promise<R>());
 //   Future<R> future = promise->future();
 //
-//   std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher(
-//       new std::tr1::function<void(ProcessBase*)>(
-//           std::tr1::bind(&internal::rdispatcher<R, T>,
-//                          std::tr1::placeholders::_1,
-//                          thunk, promise)));
+//   memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher(
+//       new lambda::function<void(ProcessBase*)>(
+//           lambda::bind(&internal::rdispatcher<R, T>,
+//                        lambda::_1,
+//                        thunk, promise)));
 //
 //   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
 //
@@ -382,18 +384,18 @@ Future<R> dispatch(
     const PID<T>& pid,
     R (T::*method)(void))
 {
-  std::tr1::shared_ptr<std::tr1::function<R(T*)> > thunk(
-      new std::tr1::function<R(T*)>(
-          std::tr1::bind(method, std::tr1::placeholders::_1)));
+  memory::shared_ptr<lambda::function<R(T*)> > thunk(
+      new lambda::function<R(T*)>(
+          lambda::bind(method, lambda::_1)));
 
-  std::tr1::shared_ptr<Promise<R> > promise(new Promise<R>());
+  memory::shared_ptr<Promise<R> > promise(new Promise<R>());
   Future<R> future = promise->future();
 
-  std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher(
-      new std::tr1::function<void(ProcessBase*)>(
-          std::tr1::bind(&internal::rdispatcher<R, T>,
-                         std::tr1::placeholders::_1,
-                         thunk, promise)));
+  memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher(
+      new lambda::function<void(ProcessBase*)>(
+          lambda::bind(&internal::rdispatcher<R, T>,
+                       lambda::_1,
+                       thunk, promise)));
 
   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
 
@@ -426,20 +428,20 @@ Future<R> dispatch(
       R (T::*method)(ENUM_PARAMS(N, P)),                                \
       ENUM_BINARY_PARAMS(N, A, a))                                      \
   {                                                                     \
-    std::tr1::shared_ptr<std::tr1::function<R(T*)> > thunk(             \
-        new std::tr1::function<R(T*)>(                                  \
-            std::tr1::bind(method,                                      \
-                           std::tr1::placeholders::_1,                  \
-                           ENUM_PARAMS(N, a))));                        \
+    memory::shared_ptr<lambda::function<R(T*)> > thunk(                 \
+        new lambda::function<R(T*)>(                                    \
+            lambda::bind(method,                                        \
+                         lambda::_1,                                    \
+                         ENUM_PARAMS(N, a))));                          \
                                                                         \
-    std::tr1::shared_ptr<Promise<R> > promise(new Promise<R>());        \
+    memory::shared_ptr<Promise<R> > promise(new Promise<R>());          \
     Future<R> future = promise->future();                               \
                                                                         \
-    std::tr1::shared_ptr<std::tr1::function<void(ProcessBase*)> > dispatcher( \
-        new std::tr1::function<void(ProcessBase*)>(                     \
-            std::tr1::bind(&internal::rdispatcher<R, T>,                \
-                           std::tr1::placeholders::_1,                  \
-                           thunk, promise)));                           \
+    memory::shared_ptr<lambda::function<void(ProcessBase*)> > dispatcher( \
+        new lambda::function<void(ProcessBase*)>(                       \
+            lambda::bind(&internal::rdispatcher<R, T>,                  \
+                         lambda::_1,                                    \
+                         thunk, promise)));                             \
                                                                         \
     internal::dispatch(pid, dispatcher, internal::canonicalize(method)); \
                                                                         \
@@ -476,3 +478,4 @@ Future<R> dispatch(
 } // namespace process {
 
 #endif // __PROCESS_DISPATCH_HPP__
+#endif // __cplusplus >= 201103L

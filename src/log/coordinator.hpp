@@ -19,92 +19,58 @@
 #ifndef __LOG_COORDINATOR_HPP__
 #define __LOG_COORDINATOR_HPP__
 
+#include <stdint.h>
+
 #include <string>
-#include <vector>
 
-#include <process/process.hpp>
-#include <process/timeout.hpp>
+#include <process/future.hpp>
+#include <process/shared.hpp>
 
-#include <stout/result.hpp>
+#include <stout/option.hpp>
 
 #include "log/network.hpp"
 #include "log/replica.hpp"
-
-#include "messages/log.hpp"
-
 
 namespace mesos {
 namespace internal {
 namespace log {
 
+// Forward declaration.
+class CoordinatorProcess;
+
+
 class Coordinator
 {
 public:
-  Coordinator(int quorum, Replica* replica, Network* group);
+  Coordinator(
+      size_t _quorum,
+      const process::Shared<Replica>& _replica,
+      const process::Shared<Network>& _network);
 
   ~Coordinator();
 
-  // Handles coordinator election/demotion. A result of none means the
-  // coordinator failed to achieve a quorum (e.g., due to timeout) but
-  // can be retried. A some result returns the last committed log
-  // position.
-  Result<uint64_t> elect(const process::Timeout& timeout);
-  Result<uint64_t> demote();
+  // Handles coordinator election. Returns the last committed (a.k.a.,
+  // learned) log position if the operation succeeds. Returns none if
+  // the election is not successful, but can be retried.
+  process::Future<Option<uint64_t> > elect();
 
-  // Returns the result of trying to append the specified bytes. A
-  // result of none means the append failed (e.g., due to timeout),
-  // but can be retried.
-  Result<uint64_t> append(
-      const std::string& bytes,
-      const process::Timeout& timeout);
+  // Handles coordinator demotion. Returns the last committed (a.k.a.,
+  // learned) log position if the operation succeeds. One should only
+  // call this function if the coordinator has been elected, and no
+  // write (append or truncate) is in progress.
+  process::Future<uint64_t> demote();
 
-  // Returns the result of trying to truncate the log (from the
-  // beginning to the specified position exclusive). A result of
-  // none means the truncate failed (e.g., due to timeout), but can be
-  // retried.
-  Result<uint64_t> truncate(uint64_t to, const process::Timeout& timeout);
+  // Appends the specified bytes to the end of the log. Returns the
+  // position of the appended entry if the operation succeeds.
+  process::Future<uint64_t> append(const std::string& bytes);
+
+  // Removes all log entries preceding the log entry at the given
+  // position (to). Returns the position at which the truncate
+  // operation is written if the operation succeeds.
+  process::Future<uint64_t> truncate(uint64_t to);
 
 private:
-  // Helper that tries to achieve consensus of the specified action. A
-  // result of none means the write failed (e.g., due to timeout), but
-  // can be retried.
-  Result<uint64_t> write(const Action& action, const process::Timeout& timeout);
-
-  // Helper that handles commiting an action (i.e., writing to the
-  // local replica and then sending out learned messages).
-  Result<uint64_t> commit(const Action& action);
-
-  // Helper that tries to fill a position in the log.
-  Result<Action> fill(uint64_t position, const process::Timeout& timeout);
-
-  // Helper that uses the specified protocol to broadcast a request to
-  // our group and return a set of futures.
-  template <typename Req, typename Res>
-  std::set<process::Future<Res> > broadcast(
-      const Protocol<Req, Res>& protocol,
-      const Req& req);
-
-  // Helper like broadcast, but excludes our local replica.
-  template <typename Req, typename Res>
-  std::set<process::Future<Res> > remotecast(
-      const Protocol<Req, Res>& protocol,
-      const Req& req);
-
-  // Helper like remotecast but ignores any responses.
-  template <typename M>
-  void remotecast(const M& m);
-
-  bool elected; // True if this coordinator has been elected.
-
-  const uint32_t quorum; // Quorum size.
-
-  Replica* replica; // Local log replica.
-
-  Network* network; // Used to broadcast requests and messages to replicas.
-
-  uint64_t id; // Coordinator ID.
-
-  uint64_t index; // Last position written in the log.
+  CoordinatorProcess* process;
 };
 
 } // namespace log {

@@ -28,6 +28,7 @@ EXTRA_DIST =					\
   include/stout/json.hpp			\
   include/stout/lambda.hpp			\
   include/stout/linkedhashmap.hpp		\
+  include/stout/memory.hpp			\
   include/stout/multihashmap.hpp		\
   include/stout/multimap.hpp			\
   include/stout/net.hpp				\
@@ -60,6 +61,7 @@ EXTRA_DIST =					\
   include/stout/strings.hpp			\
   include/stout/thread.hpp			\
   include/stout/try.hpp				\
+  include/stout/unreachable.hpp			\
   include/stout/utils.hpp			\
   include/stout/uuid.hpp			\
   tests/bytes_tests.cpp				\

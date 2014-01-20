@@ -1,26 +1,24 @@
-<ul class="breadcrumb">
+<ol class="breadcrumb">
   <li>
     <a class="badge badge-type" href="#">Master</a>
-    <span class="divider">/</span>
   </li>
   <li>
     <a class="badge badge-type" href="#/slaves/{{slave_id}}" title="{{slave_id}}">
       Slave</a>
-    <span class="divider">/</span>
   </li>
   <li class="active">
     <span class="badge badge-type">Framework</span>
     {{framework.id}}
   </li>
-</ul>
+</ol>
 
 <div class="alert alert-error hide" id="alert">
   <button class="close" data-dismiss="alert">×</button>
   <strong>{{alert_message}}</strong>
 </div>
 
-<div class="row hide" id="slave">
-  <div class="span3">
+<div class="row" id="slave">
+  <div class="col-md-3">
     <div class="well">
       <dl class="inline clearfix">
         <dt>Name:</dt><dd>{{framework.name}}</dd>
@@ -70,45 +68,23 @@
     </div>
   </div>
 
-  <div class="span9">
-    <h3>Executors</h3>
-    <table class="table table-striped table-bordered table-condensed">
+  <div class="col-md-9">
+    <table m-table table-content="framework.executors" title="Executors"
+      class="table table-striped table-bordered table-condensed">
       <thead>
         <tr>
-          <th ng-class="columnClass('executors', 'id')"
-              ng-click="selectColumn('executors', 'id')">
-            ID
-          </th>
-          <th ng-class="columnClass('executors', 'name')"
-              ng-click="selectColumn('executors', 'name')">
-            Name
-          </th>
-          <th ng-class="columnClass('executors', 'source')"
-              ng-click="selectColumn('executors', 'source')">
-            Source
-          </th>
-          <th ng-class="columnClass('executors', 'tasks.length')"
-              ng-click="selectColumn('executors', 'tasks.length')">
-            Active Tasks
-          </th>
-          <th ng-class="columnClass('executors', 'queued_tasks.length')"
-              ng-click="selectColumn('executors', 'queued_tasks.length')">
-            Queued Tasks
-          </th>
-          <th ng-class="columnClass('executors', 'resources.cpus')"
-              ng-click="selectColumn('executors', 'resources.cpus')">
-            CPUs (Used / Allocated)
-          </th>
-          <th ng-class="columnClass('executors', 'resources.mem')"
-              ng-click="selectColumn('executors', 'resources.mem')">
-            Mem (Used / Allocated)
-          </th>
+          <th data-key="id">ID</th>
+          <th data-key="name">Name</th>
+          <th data-key="source">Source</th>
+          <th data-key="tasks.length">Active Tasks</th>
+          <th data-key="queued_tasks.length">Queued Tasks</th>
+          <th data-key="resources.cpus">CPUs (Used / Allocated)</th>
+          <th data-key="resources.mem">Mem (Used / Allocated)</th>
           <th></th>
         </tr>
       </thead>
-
       <tbody>
-        <tr ng-repeat="executor in framework.executors | orderBy:tables['executors'].selected_column:tables['executors'].reverse">
+        <tr ng-repeat="executor in $data">
           <td>
             <a href="{{'#/slaves/' + slave_id + '/frameworks/' + framework.id + '/executors/' + executor.id}}">
               {{executor.id}}
@@ -132,31 +108,18 @@
       </tbody>
     </table>
 
-    <h3>Completed Executors</h3>
-    <table class="table table-striped table-bordered table-condensed">
+    <table m-table table-content="framework.completed_executors" title="Completed Executors"
+      class="table table-striped table-bordered table-condensed">
       <thead>
         <tr>
-          <th ng-class="columnClass('completed_executors', 'id')"
-              ng-click="selectColumn('completed_executors', 'id')">
-            ID
-          </th>
-          <th ng-class="columnClass('completed_executors', 'name')"
-              ng-click="selectColumn('completed_executors', 'name')">
-            Name
-          </th>
-          <th ng-class="columnClass('completed_executors', 'source')"
-              ng-click="selectColumn('completed_executors', 'source')">
-            Source
-          </th>
-          <th ng-class="columnClass('completed_executors', 'sandbox')"
-              ng-click="selectColumn('completed_executors', 'sandbox')">
-            Sandbox
-          </th>
+          <th data-key="id">ID</th>
+          <th data-key="name">Name</th>
+          <th data-key="source">Source</th>
+          <th data-key="sandbox">Sandbox</th>
         </tr>
       </thead>
-
       <tbody>
-        <tr ng-repeat="completed_executor in framework.completed_executors | orderBy:tables['completed_executors'].selected_column:tables['completed_executors'].reverse">
+        <tr ng-repeat="completed_executor in $data">
           <td>
             <a href="{{'#/slaves/' + slave_id + '/frameworks/' + framework.id + '/executors/' + completed_executor.id}}">
               {{completed_executor.id}}

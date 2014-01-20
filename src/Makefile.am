@@ -297,9 +297,31 @@ libmesos_no_3rdparty_la_LIBADD += libbuild.la
 # Convenience library for building the replicated log in order to
 # include the leveldb headers.
 noinst_LTLIBRARIES += liblog.la
-liblog_la_SOURCES = log/coordinator.cpp log/replica.cpp
-liblog_la_SOURCES += log/coordinator.hpp log/replica.hpp log/log.hpp	\
-  log/network.hpp messages/log.hpp messages/log.proto
+liblog_la_SOURCES =							\
+  log/catchup.cpp							\
+  log/consensus.cpp							\
+  log/coordinator.cpp							\
+  log/leveldb.cpp							\
+  log/log.cpp								\
+  log/recover.cpp							\
+  log/replica.cpp							\
+  log/tool/initialize.cpp						\
+  log/tool/read.cpp
+liblog_la_SOURCES +=							\
+  log/catchup.hpp							\
+  log/consensus.hpp							\
+  log/coordinator.hpp							\
+  log/leveldb.hpp							\
+  log/log.hpp								\
+  log/network.hpp							\
+  log/recover.hpp							\
+  log/replica.hpp							\
+  log/storage.hpp							\
+  log/tool.hpp								\
+  log/tool/initialize.hpp						\
+  log/tool/read.hpp							\
+  messages/log.hpp							\
+  messages/log.proto
 nodist_liblog_la_SOURCES = $(LOG_PROTOS)
 liblog_la_CPPFLAGS = -I../$(LEVELDB)/include $(MESOS_CPPFLAGS)
 
@@ -426,15 +448,13 @@ dist_mesospythonpkglibexec_SCRIPTS =					\
 # 'localstatedir' (e.g., /usr/local/var) is for modifiable "data".
 nobase_dist_pkgdata_DATA +=						\
   webui/master/static/js/controllers.js					\
-  webui/master/static/js/marked.min.js					\
   webui/master/static/js/app.js						\
   webui/master/static/js/services.js					\
   webui/master/static/js/jquery.pailer.js
 
 # Need to distribute/install webui CSS.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/css/bootstrap-responsive-2.3.2.min.css		\
-  webui/master/static/css/bootstrap-2.3.2.min.css			\
+  webui/master/static/css/bootstrap-3.0.3.min.css			\
   webui/master/static/css/mesos.css
 
 # Need to distribute/install webui HTML.
@@ -444,28 +464,37 @@ nobase_dist_pkgdata_DATA +=						\
   webui/master/static/frameworks.html					\
   webui/master/static/home.html						\
   webui/master/static/index.html					\
+  webui/master/static/offers.html					\
   webui/master/static/pailer.html					\
   webui/master/static/slave.html					\
   webui/master/static/slave_executor.html				\
   webui/master/static/slave_framework.html				\
   webui/master/static/slaves.html					\
-  webui/master/static/directives/timestamp.html
+  webui/master/static/directives/timestamp.html				\
+  webui/master/static/directives/pagination.html			\
+  webui/master/static/directives/tableHeader.html
+
 
 # Need to distribute/install webui images.
 nobase_dist_pkgdata_DATA +=						\
   webui/master/static/img/loading.gif					\
-  webui/master/static/img/glyphicons-halflings-white.png		\
-  webui/master/static/img/glyphicons-halflings.png			\
   webui/master/static/ico/favicon.ico
+
+# Need to distribute/install webui fonts.
+nobase_dist_pkgdata_DATA +=						\
+  webui/master/static/fonts/glyphicons-halflings-regular.eot		\
+  webui/master/static/fonts/glyphicons-halflings-regular.svg		\
+  webui/master/static/fonts/glyphicons-halflings-regular.ttf		\
+  webui/master/static/fonts/glyphicons-halflings-regular.woff
 
 # Need to distribute/install third-party javascript.
 nobase_dist_pkgdata_DATA +=						\
   webui/master/static/js/angular-1.2.3.js				\
   webui/master/static/js/angular-1.2.3.min.js				\
-  webui/master/static/js/angular-route-1.2.3.js			\
+  webui/master/static/js/angular-route-1.2.3.js				\
   webui/master/static/js/angular-route-1.2.3.min.js			\
-  webui/master/static/js/ui-bootstrap-tpls-0.7.0.js			\
-  webui/master/static/js/ui-bootstrap-tpls-0.7.0.min.js		\
+  webui/master/static/js/ui-bootstrap-tpls-0.9.0.js			\
+  webui/master/static/js/ui-bootstrap-tpls-0.9.0.min.js			\
   webui/master/static/js/underscore-1.4.3.js				\
   webui/master/static/js/underscore-1.4.3.min.js			\
   webui/master/static/js/jquery-1.7.1.js				\
@@ -592,6 +621,7 @@ libjava_la_SOURCES =							\
 	jvm/java/net.hpp						\
 	jvm/org/apache/log4j.cpp					\
 	jvm/org/apache/log4j.hpp					\
+	jvm/org/apache/zookeeper.cpp					\
 	jvm/org/apache/zookeeper.hpp
 
 libjava_la_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -712,8 +742,8 @@ PROTOBUF_EGG = ../$(PROTOBUF)/python/dist/protobuf-$(PROTOBUF_EGG_SUFFIX)
 $(PROTOBUF_EGG):
 	@echo "Building protobuf Python egg ..."
 	cd ../$(PROTOBUF)/python && \
-	   CC="$(CC)" CXX="$(CXX)" CFLAGS="$(CFLAGS)" CXXFLAGS="$(CXXFLAGS)" \
-	   PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) setup.py bdist_egg
+          CC="$(CC)" CXX="$(CXX)" CFLAGS="$(CFLAGS)" CXXFLAGS="$(CXXFLAGS)" \
+	  PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) setup.py build bdist_egg
 
 CLEANFILES += $(PROTOBUF_EGG)
 
@@ -742,8 +772,8 @@ $(MESOS_EGG): python/setup.py $(srcdir)/python/src/mesos.py		\
 	  $(MKDIR_P) python/src;					\
 	  cp -pf $(srcdir)/python/src/mesos.py python/src;		\
 	fi
-	@LIBS="$(LIBS)" PYTHONPATH=$(DISTRIBUTE_EGG)			\
-	  $(PYTHON) python/setup.py bdist_egg
+	@LIBS="$(LIBS)" CC="$(CC)" CXX="$(CXX)"				\
+	  PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) python/setup.py bdist_egg
 
 CLEANFILES += $(MESOS_EGG) python/build/temp.*/native/*.o python/build/lib.*/*
 

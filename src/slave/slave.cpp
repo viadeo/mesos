@@ -147,14 +147,14 @@ void Slave::initialize()
   if (!resources.mem().isSome()) {
     Bytes mem;
 
-    Try<Bytes> mem_ = os::memory();
+    Try<os::Memory> mem_ = os::memory();
     if (!mem_.isSome()) {
       LOG(WARNING) << "Failed to auto-detect the size of main memory: '"
                    << mem_.error()
                    << "' ; defaulting to " << DEFAULT_MEM;
       mem = DEFAULT_MEM;
     } else {
-      mem = mem_.get();
+      mem = mem_.get().total;
 
       // Leave 1 GB free if we have more than 1 GB, otherwise, use all!
       // TODO(benh): Have better default scheme (e.g., % of mem not
@@ -465,7 +465,7 @@ void Slave::fileAttached(const Future<Nothing>& result, const string& path)
     VLOG(1) << "Successfully attached file '" << path << "'";
   } else {
     LOG(ERROR) << "Failed to attach file '" << path << "': "
-               << result.isFailed() ? result.failure() : "discarded";
+               << (result.isFailed() ? result.failure() : "discarded");
   }
 }
 
@@ -3229,9 +3229,8 @@ void Executor::completeTask(const TaskID& taskId)
     << "Failed to find terminated task " << taskId;
 
   Task* task = terminatedTasks[taskId];
-  completedTasks.push_back(*task);
+  completedTasks.push_back(memory::shared_ptr<Task>(task));
   terminatedTasks.erase(taskId);
-  delete task;
 }
 
 

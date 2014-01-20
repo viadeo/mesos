@@ -27,6 +27,7 @@
 
 #include <stout/duration.hpp>
 #include <stout/gtest.hpp>
+#include <stout/lambda.hpp>
 #include <stout/nothing.hpp>
 #include <stout/os.hpp>
 #include <stout/stringify.hpp>
@@ -107,7 +108,7 @@ TEST(Process, onAny)
 {
   bool b = false;
   Future<bool>(true)
-    .onAny(std::tr1::bind(&onAny, std::tr1::placeholders::_1, &b));
+    .onAny(lambda::bind(&onAny, lambda::_1, &b));
   EXPECT_TRUE(b);
 }
 
@@ -137,13 +138,13 @@ TEST(Process, then)
   promise.set(&i);
 
   Future<string> future = promise.future()
-    .then(std::tr1::bind(&itoa1, std::tr1::placeholders::_1));
+    .then(lambda::bind(&itoa1, lambda::_1));
 
   ASSERT_TRUE(future.isReady());
   EXPECT_EQ("42", future.get());
 
   future = promise.future()
-    .then(std::tr1::bind(&itoa2, std::tr1::placeholders::_1));
+    .then(lambda::bind(&itoa2, lambda::_1));
 
   ASSERT_TRUE(future.isReady());
   EXPECT_EQ("42", future.get());
@@ -185,8 +186,8 @@ TEST(Process, chain)
   Promise<int*> promise;
 
   Future<string> s = readyFuture()
-    .then(std::tr1::bind(&second, std::tr1::placeholders::_1))
-    .then(std::tr1::bind(&third, std::tr1::placeholders::_1));
+    .then(lambda::bind(&second, lambda::_1))
+    .then(lambda::bind(&third, lambda::_1));
 
   s.await();
 
@@ -194,8 +195,8 @@ TEST(Process, chain)
   EXPECT_EQ("true", s.get());
 
   s = failedFuture()
-    .then(std::tr1::bind(&second, std::tr1::placeholders::_1))
-    .then(std::tr1::bind(&third, std::tr1::placeholders::_1));
+    .then(lambda::bind(&second, lambda::_1))
+    .then(lambda::bind(&third, lambda::_1));
 
   s.await();
 
@@ -204,8 +205,8 @@ TEST(Process, chain)
   Future<bool> future;
 
   s = pendingFuture(&future)
-    .then(std::tr1::bind(&second, std::tr1::placeholders::_1))
-    .then(std::tr1::bind(&third, std::tr1::placeholders::_1));
+    .then(lambda::bind(&second, lambda::_1))
+    .then(lambda::bind(&third, lambda::_1));
 
   ASSERT_TRUE(s.isPending());
   ASSERT_TRUE(future.isPending());
@@ -349,14 +350,14 @@ TEST(Process, defer1)
 
   {
     Deferred<Future<bool>(bool)> func4 =
-      defer(pid, &DispatchProcess::func4, std::tr1::placeholders::_1, 42);
+      defer(pid, &DispatchProcess::func4, lambda::_1, 42);
     future = func4(false);
     EXPECT_FALSE(future.get());
   }
 
   {
     Deferred<Future<bool>(int)> func4 =
-      defer(pid, &DispatchProcess::func4, true, std::tr1::placeholders::_1);
+      defer(pid, &DispatchProcess::func4, true, lambda::_1);
     future = func4(42);
     EXPECT_TRUE(future.get());
   }
@@ -373,7 +374,7 @@ class DeferProcess : public Process<DeferProcess>
 public:
   Future<string> func1(const Future<int>& f)
   {
-    return f.then(defer(self(), &Self::_func1, std::tr1::placeholders::_1));
+    return f.then(defer(self(), &Self::_func1, lambda::_1));
   }
 
   Future<string> func2(const Future<int>& f)
@@ -436,18 +437,26 @@ TEST(Process, defer3)
   volatile bool bool2 = false;
 
   Deferred<void(bool)> set1 =
+#if __cplusplus >= 201103L
+    defer([&bool1] (bool b) { bool1 = b; });
+#else // __cplusplus >= 201103L
     defer(std::tr1::function<void(bool)>(
               std::tr1::bind(&set<volatile bool>,
                              &bool1,
                              std::tr1::placeholders::_1)));
+#endif // __cplusplus >= 201103L
 
   set1(true);
 
   Deferred<void(bool)> set2 =
+#if __cplusplus >= 201103L
+    defer([&bool2] (bool b) { bool2 = b; });
+#else // __cplusplus >= 201103L
     defer(std::tr1::function<void(bool)>(
               std::tr1::bind(&set<volatile bool>,
                              &bool2,
                              std::tr1::placeholders::_1)));
+#endif // __cplusplus >= 201103L
 
   set2(true);
 
@@ -1056,16 +1065,17 @@ TEST(Process, executor)
   Executor executor;
 
   Deferred<void(int)> event1 =
-    executor.defer(std::tr1::bind(&EventReceiver::event1,
-                                  &receiver,
-                                  std::tr1::placeholders::_1));
-
+    executor.defer(lambda::function<void(int)>(
+                       lambda::bind(&EventReceiver::event1,
+                                    &receiver,
+                                    lambda::_1)));
   event1(42);
 
   Deferred<void(const string&)> event2 =
-    executor.defer(std::tr1::bind(&EventReceiver::event2,
-                                  &receiver,
-                                  std::tr1::placeholders::_1));
+    executor.defer(lambda::function<void(const string&)>(
+                       lambda::bind(&EventReceiver::event2,
+                                    &receiver,
+                                    lambda::_1)));
 
   event2("event2");
 
@@ -1257,3 +1267,149 @@ TEST(Process, provide)
 
   ASSERT_SOME(os::rmdir(path));
 }
+
+
+#if __cplusplus >= 201103L
+int baz(string s) { return 42; }
+
+Future<int> bam(string s) { return 42; }
+
+
+TEST(Process, defers)
+{
+  {
+    std::function<Future<int>(string)> f =
+      defer(std::bind(baz, std::placeholders::_1));
+
+    Deferred<Future<int>(string)> d =
+      defer(std::bind(baz, std::placeholders::_1));
+
+    Future<int> future = Future<string>().then(
+        defer(std::bind(baz, std::placeholders::_1)));
+
+    Future<int> future3 = Future<string>().then(
+        std::bind(baz, std::placeholders::_1));
+
+    Future<string>().then(std::function<int(string)>());
+    Future<string>().then(std::function<int(void)>());
+
+    Future<int> future11 = Future<string>().then(
+        defer(std::bind(bam, std::placeholders::_1)));
+
+    Future<int> future12 = Future<string>().then(
+        std::bind(bam, std::placeholders::_1));
+
+    std::function<Future<int>(string)> f2 =
+      defer([] (string s) { return baz(s); });
+
+    Deferred<Future<int>(string)> d2 =
+      defer([] (string s) { return baz(s); });
+
+    Future<int> future2 = Future<string>().then(
+        defer([] (string s) { return baz(s); }));
+
+    Future<int> future4 = Future<string>().then(
+        [] (string s) { return baz(s); });
+
+    Future<int> future5 = Future<string>().then(
+        defer([] (string s) -> Future<int> { return baz(s); }));
+
+    Future<int> future6 = Future<string>().then(
+        defer([] (string s) { return Future<int>(baz(s)); }));
+
+    Future<int> future7 = Future<string>().then(
+        defer([] (string s) { return bam(s); }));
+
+    Future<int> future8 = Future<string>().then(
+        [] (string s) { return Future<int>(baz(s)); });
+
+    Future<int> future9 = Future<string>().then(
+        [] (string s) -> Future<int> { return baz(s); });
+
+    Future<int> future10 = Future<string>().then(
+        [] (string s) { return bam(s); });
+  }
+
+//   {
+//     // CAN NOT DO IN CLANG!
+//     std::function<void(string)> f =
+//       defer(std::bind(baz, std::placeholders::_1));
+
+//     std::function<int(string)> blah;
+//     std::function<void(string)> blam = blah;
+
+//     std::function<void(string)> f2 =
+//       defer([] (string s) { return baz(s); });
+//   }
+
+//   {
+//     // CAN NOT DO WITH GCC OR CLANG!
+//     std::function<int(int)> f =
+//       defer(std::bind(baz, std::placeholders::_1));
+//   }
+
+  {
+    std::function<Future<int>(void)> f =
+      defer(std::bind(baz, "42"));
+
+    std::function<Future<int>(void)> f2 =
+      defer([] () { return baz("42"); });
+  }
+
+  {
+    std::function<Future<int>(int)> f =
+      defer(std::bind(baz, "42"));
+
+    std::function<Future<int>(int)> f2 =
+      defer([] (int i) { return baz("42"); });
+  }
+
+  // Don't care about value passed from Future::then.
+  {
+    Future<int> future = Future<string>().then(
+        defer(std::bind(baz, "42")));
+
+    Future<int> future3 = Future<string>().then(
+        std::bind(baz, "42"));
+
+    Future<int> future11 = Future<string>().then(
+        defer(std::bind(bam, "42")));
+
+    Future<int> future12 = Future<string>().then(
+        std::bind(bam, "42"));
+
+    Future<int> future2 = Future<string>().then(
+        defer([] () { return baz("42"); }));
+
+    Future<int> future4 = Future<string>().then(
+        [] () { return baz("42"); });
+
+    Future<int> future5 = Future<string>().then(
+        defer([] () -> Future<int> { return baz("42"); }));
+
+    Future<int> future6 = Future<string>().then(
+        defer([] () { return Future<int>(baz("42")); }));
+
+    Future<int> future7 = Future<string>().then(
+        defer([] () { return bam("42"); }));
+
+    Future<int> future8 = Future<string>().then(
+        [] () { return Future<int>(baz("42")); });
+
+    Future<int> future9 = Future<string>().then(
+        [] () -> Future<int> { return baz("42"); });
+
+    Future<int> future10 = Future<string>().then(
+        [] () { return bam("42"); });
+  }
+
+  struct Functor
+  {
+    int operator () (string) const { return 42; }
+    int operator () () const { return 42; }
+  } functor;
+
+  Future<int> future13 = Future<string>().then(
+      defer(functor));
+}
+#endif // __cplusplus >= 201103L

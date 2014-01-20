@@ -18,524 +18,451 @@
 
 #include <algorithm>
 
+#include <process/defer.hpp>
 #include <process/dispatch.hpp>
-#include <process/future.hpp>
+#include <process/id.hpp>
+#include <process/process.hpp>
 
-#include <stout/check.hpp>
-#include <stout/duration.hpp>
-#include <stout/error.hpp>
-#include <stout/foreach.hpp>
 #include <stout/none.hpp>
 
+#include "common/type_utils.hpp"
+
+#include "log/catchup.hpp"
+#include "log/consensus.hpp"
 #include "log/coordinator.hpp"
-#include "log/replica.hpp"
+
+#include "messages/log.hpp"
 
 using namespace process;
 
-using std::list;
-using std::pair;
 using std::set;
 using std::string;
-
 
 namespace mesos {
 namespace internal {
 namespace log {
 
-Coordinator::Coordinator(int _quorum,
-                         Replica* _replica,
-                         Network* _network)
-  : elected(false),
-    quorum(_quorum),
-    replica(_replica),
-    network(_network),
-    id(0),
-    index(0) {}
-
-
-Coordinator::~Coordinator() {}
-
-
-Result<uint64_t> Coordinator::elect(const Timeout& timeout)
+class CoordinatorProcess : public Process<CoordinatorProcess>
 {
-  LOG(INFO) << "Coordinator attempting to get elected within "
-            << timeout.remaining();
+public:
+  CoordinatorProcess(
+      size_t _quorum,
+      const Shared<Replica>& _replica,
+      const Shared<Network>& _network)
+    : ProcessBase(ID::generate("log-coordinator")),
+      quorum(_quorum),
+      replica(_replica),
+      network(_network),
+      state(INITIAL),
+      proposal(0),
+      index(0) {}
 
-  if (elected) {
-    // TODO(benh): No-op instead of error?
-    return Error("Coordinator already elected");
+  virtual ~CoordinatorProcess() {}
+
+  // See comments in 'coordinator.hpp'.
+  Future<Option<uint64_t> > elect();
+  Future<uint64_t> demote();
+  Future<uint64_t> append(const string& bytes);
+  Future<uint64_t> truncate(uint64_t to);
+
+protected:
+  virtual void finalize()
+  {
+    electing.discard();
+    writing.discard();
   }
 
-  // Get the highest known promise from our local replica.
-  Future<uint64_t> promise = replica->promised();
+private:
+  /////////////////////////////////
+  // Election related functions. //
+  /////////////////////////////////
 
-  if (!promise.await(timeout.remaining())) {
-    return None();
-  } else if (promise.isFailed()) {
-    return Error(promise.failure());
+  Future<uint64_t> getLastProposal();
+  Future<Nothing> updateProposal(uint64_t promised);
+  Future<PromiseResponse> runPromisePhase();
+  Future<Option<uint64_t> > checkPromisePhase(const PromiseResponse& response);
+  Future<set<uint64_t> > getMissingPositions();
+  Future<Nothing> catchupMissingPositions(const set<uint64_t>& positions);
+  Future<Option<uint64_t> > updateIndexAfterElected();
+  void electingFinished(const Option<uint64_t>& position);
+  void electingFailed();
+  void electingAborted();
+
+  /////////////////////////////////
+  // Writing related functions.  //
+  /////////////////////////////////
+
+  Future<uint64_t> write(const Action& action);
+  Future<WriteResponse> runWritePhase(const Action& action);
+  Future<Nothing> checkWritePhase(const WriteResponse& response);
+  Future<Nothing> runLearnPhase(const Action& action);
+  Future<bool> checkLearnPhase(const Action& action);
+  Future<uint64_t> updateIndexAfterWritten(bool missing);
+  void writingFinished();
+  void writingFailed();
+  void writingAborted();
+
+  const size_t quorum;
+  const Shared<Replica> replica;
+  const Shared<Network> network;
+
+  // The current state of the coordinator. A coordinator needs to be
+  // elected first to perform append and truncate operations. If one
+  // tries to do an append or a truncate while the coordinator is not
+  // elected, a failed future will be returned immediately. A
+  // coordinator does not declare itself as elected until it wins the
+  // election and has filled all existing positions. A coordinator is
+  // put in electing state after it decides to go for an election and
+  // before it is elected.
+  enum {
+    INITIAL,
+    ELECTING,
+    ELECTED,
+    WRITING,
+  } state;
+
+  // The current proposal number used by this coordinator.
+  uint64_t proposal;
+
+  // The position to which the next entry will be written.
+  uint64_t index;
+
+  Future<Option<uint64_t> > electing;
+  Future<uint64_t> writing;
+};
+
+
+/////////////////////////////////////////////////
+// Handles elect/demote in CoordinatorProcess.
+/////////////////////////////////////////////////
+
+
+Future<Option<uint64_t> > CoordinatorProcess::elect()
+{
+  if (state == ELECTING) {
+    return Future<Option<uint64_t> >::failed(
+        "Coordinator already being elected");
+  } else if (state == ELECTED) {
+    return Future<Option<uint64_t> >::failed(
+        "Coordinator already elected");
+  } else if (state == WRITING) {
+    return Future<Option<uint64_t> >::failed(
+        "Coordinator already elected, and is currently writing");
   }
 
-  CHECK(promise.isReady()) << "Not expecting a discarded future!";
+  CHECK_EQ(state, INITIAL);
 
-  id = std::max(id, promise.get()) + 1; // Try the next highest!
+  state = ELECTING;
 
-  PromiseRequest request;
-  request.set_id(id);
+  electing = getLastProposal()
+    .then(defer(self(), &Self::updateProposal, lambda::_1))
+    .then(defer(self(), &Self::runPromisePhase))
+    .then(defer(self(), &Self::checkPromisePhase, lambda::_1))
+    .onReady(defer(self(), &Self::electingFinished, lambda::_1))
+    .onFailed(defer(self(), &Self::electingFailed))
+    .onDiscarded(defer(self(), &Self::electingAborted));
 
-  // Broadcast the request to the network.
-  set<Future<PromiseResponse> > futures =
-    broadcast(protocol::promise, request);
-
-  uint32_t okays = 0;
-
-  do {
-    Future<Future<PromiseResponse> > future = select(futures);
-    if (future.await(timeout.remaining())) {
-      CHECK(future.get().isReady());
-      const PromiseResponse& response = future.get().get();
-      if (!response.okay()) {
-        return None(); // Lost an election, but can retry.
-      } else if (response.okay()) {
-        CHECK(response.has_position());
-        index = std::max(index, response.position());
-        okays++;
-        if (okays >= quorum) {
-          break;
-        }
-      }
-      futures.erase(future.get());
-    }
-  } while (timeout.remaining() > Seconds(0));
-
-  // Discard the remaining futures.
-  discard(futures);
-
-  // Either we have a quorum or we timed out.
-  if (okays >= quorum) {
-    LOG(INFO) << "Coordinator elected, attempting to fill missing positions";
-    elected = true;
-
-    // Need to "catchup" local replica (i.e., fill in any unlearned
-    // and/or missing positions) so that we can do local reads.
-    // Usually we could do this lazily, however, a local learned
-    // position might have been truncated, so we actually need to
-    // catchup the local replica all the way to the end of the log
-    // before we can perform any up-to-date local reads.
-
-    Future<set<uint64_t> > positions = replica->missing(index);
-
-    if (!positions.await(timeout.remaining())) {
-      elected = false;
-      return None();
-    } else if (positions.isFailed()) {
-      elected = false;
-      return Error(positions.failure());
-    }
-
-    CHECK(positions.isReady()) << "Not expecting a discarded future!";
-
-    foreach (uint64_t position, positions.get()) {
-      Result<Action> result = fill(position, timeout);
-      if (result.isError()) {
-        elected = false;
-        return Error(result.error());
-      } else if (result.isNone()) {
-        elected = false;
-        return None();
-      } else {
-        CHECK_SOME(result);
-        CHECK(result.get().position() == position);
-      }
-    }
-
-    index += 1;
-    return index - 1;
-  }
-
-  // Timed out ...
-  LOG(INFO) << "Coordinator timed out while trying to get elected";
-  return None();
+  return electing;
 }
 
 
-Result<uint64_t> Coordinator::demote()
+Future<uint64_t> CoordinatorProcess::getLastProposal()
 {
-  elected = false;
+  return replica->promised();
+}
+
+
+Future<Nothing> CoordinatorProcess::updateProposal(uint64_t promised)
+{
+  // It is possible that we have already tried an election and lost.
+  // We save the proposal number used in the last election in field
+  // 'proposal', and will try at least the proposal number we had
+  // before or greater in the next election.
+  proposal = std::max(proposal, promised) + 1;
+  return Nothing();
+}
+
+
+Future<PromiseResponse> CoordinatorProcess::runPromisePhase()
+{
+  return log::promise(quorum, network, proposal);
+}
+
+
+Future<Option<uint64_t> > CoordinatorProcess::checkPromisePhase(
+    const PromiseResponse& response)
+{
+  if (!response.okay()) {
+    // Lost an election, but can be retried. We save the proposal
+    // number here so that most likely we will have a high enough
+    // proposal number when we retry.
+    CHECK_LE(proposal, response.proposal());
+    proposal = response.proposal();
+
+    return None();
+  } else {
+    CHECK(response.has_position());
+    index = response.position();
+
+    // Need to "catch-up" local replica (i.e., fill in any unlearned
+    // and/or missing positions) so that we can do local reads.
+    // Usually we could do this lazily, however, a local learned
+    // position might have been truncated, so we actually need to
+    // catch-up the local replica all the way to the end of the log
+    // before we can perform any up-to-date local reads.
+    return getMissingPositions()
+      .then(defer(self(), &Self::catchupMissingPositions, lambda::_1))
+      .then(defer(self(), &Self::updateIndexAfterElected));
+   }
+}
+
+
+Future<set<uint64_t> > CoordinatorProcess::getMissingPositions()
+{
+  return replica->missing(0, index);
+}
+
+
+Future<Nothing> CoordinatorProcess::catchupMissingPositions(
+    const set<uint64_t>& positions)
+{
+  LOG(INFO) << "Coordinator attemping to fill missing position";
+
+  return log::catchup(quorum, replica, network, proposal, positions);
+}
+
+
+Future<Option<uint64_t> > CoordinatorProcess::updateIndexAfterElected()
+{
+  return Option<uint64_t>(index++);
+}
+
+
+void CoordinatorProcess::electingFinished(const Option<uint64_t>& position)
+{
+  CHECK_EQ(state, ELECTING);
+
+  if (position.isNone()) {
+    state = INITIAL;
+  } else {
+    state = ELECTED;
+  }
+}
+
+
+void CoordinatorProcess::electingFailed()
+{
+  CHECK_EQ(state, ELECTING);
+  state = INITIAL;
+}
+
+
+void CoordinatorProcess::electingAborted()
+{
+  CHECK_EQ(state, ELECTING);
+  state = INITIAL;
+}
+
+
+Future<uint64_t> CoordinatorProcess::demote()
+{
+  if (state == INITIAL) {
+    return Future<uint64_t>::failed("Coordinator is not elected");
+  } else if (state == ELECTING) {
+    return Future<uint64_t>::failed("Coordinator is being elected");
+  } else if (state == WRITING) {
+    return Future<uint64_t>::failed("Coordinator is currently writing");
+  }
+
+  CHECK_EQ(state, ELECTED);
+
+  state = INITIAL;
   return index - 1;
 }
 
 
-Result<uint64_t> Coordinator::append(
-    const string& bytes,
-    const Timeout& timeout)
+/////////////////////////////////////////////////
+// Handles write in CoordinatorProcess.
+/////////////////////////////////////////////////
+
+
+Future<uint64_t> CoordinatorProcess::append(const string& bytes)
 {
-  if (!elected) {
-    return Error("Coordinator not elected");
+  if (state == INITIAL) {
+    return Future<uint64_t>::failed("Coordinator is not elected");
+  } else if (state == ELECTING) {
+    return Future<uint64_t>::failed("Coordinator is being elected");
+  } else if (state == WRITING) {
+    return Future<uint64_t>::failed("Coordinator is currently writing");
   }
 
   Action action;
   action.set_position(index);
-  action.set_promised(id);
-  action.set_performed(id);
+  action.set_promised(proposal);
+  action.set_performed(proposal);
   action.set_type(Action::APPEND);
   Action::Append* append = action.mutable_append();
   append->set_bytes(bytes);
 
-  Result<uint64_t> result = write(action, timeout);
-
-  if (result.isSome()) {
-    CHECK(result.get() == index);
-    index++;
-  }
-
-  return result;
+  return write(action);
 }
 
 
-Result<uint64_t> Coordinator::truncate(
-    uint64_t to,
-    const Timeout& timeout)
+Future<uint64_t> CoordinatorProcess::truncate(uint64_t to)
 {
-  if (!elected) {
-    return Error("Coordinator not elected");
+  if (state == INITIAL) {
+    return Future<uint64_t>::failed("Coordinator is not elected");
+  } else if (state == ELECTING) {
+    return Future<uint64_t>::failed("Coordinator is being elected");
+  } else if (state == WRITING) {
+    return Future<uint64_t>::failed("Coordinator is currently writing");
   }
 
   Action action;
   action.set_position(index);
-  action.set_promised(id);
-  action.set_performed(id);
+  action.set_promised(proposal);
+  action.set_performed(proposal);
   action.set_type(Action::TRUNCATE);
   Action::Truncate* truncate = action.mutable_truncate();
   truncate->set_to(to);
 
-  Result<uint64_t> result = write(action, timeout);
-
-  if (result.isSome()) {
-    CHECK(result.get() == index);
-    index++;
-  }
-
-  return result;
+  return write(action);
 }
 
 
-Result<uint64_t> Coordinator::write(
-    const Action& action,
-    const Timeout& timeout)
+Future<uint64_t> CoordinatorProcess::write(const Action& action)
 {
-  LOG(INFO) << "Coordinator attempting to write "
-            << Action::Type_Name(action.type())
-            << " action at position " << action.position()
-            << " within " << timeout.remaining();
-
-  CHECK(elected);
-
-  CHECK(action.has_performed());
-  CHECK(action.has_type());
-
-  // TODO(benh): Eliminate this special case hack?
-  if (quorum == 1) {
-    Result<uint64_t> result = commit(action);
-    if (result.isError()) {
-      return Error(result.error());
-    } else if (result.isNone()) {
-      return None();
-    } else {
-      CHECK_SOME(result);
-      return action.position();
-    }
-  }
-
-  WriteRequest request;
-  request.set_id(id);
-  request.set_position(action.position());
-  request.set_type(action.type());
-  switch (action.type()) {
-    case Action::NOP:
-      CHECK(action.has_nop());
-      request.mutable_nop();
-      break;
-    case Action::APPEND:
-      CHECK(action.has_append());
-      request.mutable_append()->MergeFrom(action.append());
-      break;
-    case Action::TRUNCATE:
-      CHECK(action.has_truncate());
-      request.mutable_truncate()->MergeFrom(action.truncate());
-      break;
-    default:
-      LOG(FATAL) << "Unknown Action::Type!";
-  }
-
-  // Broadcast the request to the network *excluding* the local replica.
-  set<Future<WriteResponse> > futures =
-    remotecast(protocol::write, request);
-
-  uint32_t okays = 0;
-
-  do {
-    Future<Future<WriteResponse> > future = select(futures);
-    if (future.await(timeout.remaining())) {
-      CHECK(future.get().isReady());
-      const WriteResponse& response = future.get().get();
-      CHECK(response.id() == request.id());
-      CHECK(response.position() == request.position());
-      if (!response.okay()) {
-        elected = false;
-        return Error("Coordinator demoted");
-      } else if (response.okay()) {
-        if (++okays >= (quorum - 1)) { // N.B. Using (quorum - 1) here!
-          // Got enough remote okays, discard the remaining futures
-          // and try and commit the action locally.
-          discard(futures);
-          Result<uint64_t> result = commit(action);
-          if (result.isError()) {
-            return Error(result.error());
-          } else if (result.isNone()) {
-            return None();
-          } else {
-            CHECK_SOME(result);
-            return action.position();
-          }
-        }
-      }
-      futures.erase(future.get());
-    }
-  } while (timeout.remaining() > Seconds(0));
-
-  // Timed out ... discard remaining futures.
-  LOG(INFO) << "Coordinator timed out while attempting to write "
-            << Action::Type_Name(action.type())
-            << " action at position " << action.position();
-  discard(futures);
-  return None();
-}
-
-
-Result<uint64_t> Coordinator::commit(const Action& action)
-{
-  LOG(INFO) << "Coordinator attempting to commit "
-            << Action::Type_Name(action.type())
+  LOG(INFO) << "Coordinator attempting to write " << action.type()
             << " action at position " << action.position();
 
-  CHECK(elected);
+  CHECK_EQ(state, ELECTED);
+  CHECK(action.has_performed() && action.has_type());
 
-  WriteRequest request;
-  request.set_id(id);
-  request.set_position(action.position());
-  request.set_learned(true); // A commit is just a learned write.
-  request.set_type(action.type());
-  switch (action.type()) {
-    case Action::NOP:
-      CHECK(action.has_nop());
-      request.mutable_nop();
-      break;
-    case Action::APPEND:
-      CHECK(action.has_append());
-      request.mutable_append()->MergeFrom(action.append());
-      break;
-    case Action::TRUNCATE:
-      CHECK(action.has_truncate());
-      request.mutable_truncate()->MergeFrom(action.truncate());
-      break;
-    default:
-      LOG(FATAL) << "Unknown Action::Type!";
-  }
+  state = WRITING;
 
-  //  TODO(benh): Add a non-message based way to do this write.
-  Future<WriteResponse> future = protocol::write(replica->pid(), request);
+  writing = runWritePhase(action)
+    .then(defer(self(), &Self::checkWritePhase, lambda::_1))
+    .then(defer(self(), &Self::runLearnPhase, action))
+    .then(defer(self(), &Self::checkLearnPhase, action))
+    .then(defer(self(), &Self::updateIndexAfterWritten, lambda::_1))
+    .onReady(defer(self(), &Self::writingFinished))
+    .onFailed(defer(self(), &Self::writingFailed))
+    .onDiscarded(defer(self(), &Self::writingAborted));
 
-  // We send a write request to the *local* replica just as the
-  // others: asynchronously via messages. However, rather than add the
-  // complications of dealing with timeouts for local operations
-  // (especially since we are trying to commit something), we make
-  // things simpler and block on the response from the local replica.
-  // Maybe we can let it timeout, but consider it a failure? This
-  // might be sound because we don't send the learned messages ... so
-  // this should be the same as if we just failed before we even do
-  // the write ... a client should just retry this write later.
-
-  future.await(); // TODO(benh): Don't wait forever, see comment above.
-
-  if (future.isFailed()) {
-    return Error(future.failure());
-  }
-
-  CHECK(future.isReady()) << "Not expecting a discarded future!";
-
-  const WriteResponse& response = future.get();
-  CHECK(response.id() == request.id());
-  CHECK(response.position() == request.position());
-
-  if (!response.okay()) {
-    elected = false;
-    return Error("Coordinator demoted");
-  }
-
-  // Commit successful, send a learned message to the network
-  // *excluding* the local replica and return the position.
-
-  LearnedMessage message;
-  message.mutable_action()->MergeFrom(action);
-
-  if (!action.has_learned() || !action.learned()) {
-    message.mutable_action()->set_learned(true);
-  }
-
-  LOG(INFO) << "Telling other replicas of learned action at position "
-            << action.position();
-
-  remotecast(message);
-
-  return action.position();
+  return writing;
 }
 
 
-Result<Action> Coordinator::fill(uint64_t position, const Timeout& timeout)
+Future<WriteResponse> CoordinatorProcess::runWritePhase(const Action& action)
 {
-  LOG(INFO) << "Coordinator attempting to fill position "
-            << position << " in the log";
+  return log::write(quorum, network, proposal, action);
+}
 
-  CHECK(elected);
 
-  PromiseRequest request;
-  request.set_id(id);
-  request.set_position(position);
+Future<Nothing> CoordinatorProcess::checkWritePhase(
+    const WriteResponse& response)
+{
+   if (!response.okay()) {
+    // Received a NACK. Save the proposal number.
+    CHECK_LE(proposal, response.proposal());
+    proposal = response.proposal();
 
-  // Broadcast the request to the network.
-  set<Future<PromiseResponse> > futures =
-    broadcast(protocol::promise, request);
-
-  list<PromiseResponse> responses;
-
-  do {
-    Future<Future<PromiseResponse> > future = select(futures);
-    if (future.await(timeout.remaining())) {
-      CHECK(future.get().isReady());
-      const PromiseResponse& response = future.get().get();
-      CHECK(response.id() == request.id());
-      if (!response.okay()) {
-        elected = false;
-        return Error("Coordinator demoted");
-      } else if (response.okay()) {
-        responses.push_back(response);
-        if (responses.size() >= quorum) {
-          break;
-        }
-      }
-      futures.erase(future.get());
-    }
-  } while (timeout.remaining() > Seconds(0));
-
-  // Discard the remaining futures.
-  discard(futures);
-
-  // Either have a quorum or we timed out.
-  if (responses.size() >= quorum) {
-    // Check the responses for a learned action, otherwise, pick the
-    // action with the higest performed id or a no-op if no responses
-    // include performed actions.
-    Action action;
-    foreach (const PromiseResponse& response, responses) {
-      if (response.has_action()) {
-        CHECK(response.action().position() == position);
-        if (response.action().has_learned() && response.action().learned()) {
-          // Received a learned action, try and commit locally. Note
-          // that there is no checking that we get the _same_ learned
-          // action in the event we get multiple responses with
-          // learned actions, we just take the "first". In fact, there
-          // is a specific instance in which learned actions will NOT
-          // be the same! In this instance, one replica may return
-          // that the action is a learned no-op because it knows the
-          // position has been truncated while another replica (that
-          // hasn't learned the truncation yet) might return the
-          // actual action at this position. Picking either action is
-          // _correct_, since eventually we know this position will be
-          // truncated. Fun!
-          Result<uint64_t> result = commit(response.action());
-          if (result.isError()) {
-            return Error(result.error());
-          } else if (result.isNone()) {
-            return None();
-          } else {
-            CHECK_SOME(result);
-            return response.action();
-          }
-        } else if (response.action().has_performed() &&
-                   (!action.has_performed() ||
-                    response.action().performed() > action.performed())) {
-          action = response.action();
-        }
-      } else {
-        CHECK(response.has_position());
-        CHECK(response.position() == position);
-      }
-    }
-
-    // Use a no-op if no known action has been performed.
-    if (!action.has_performed()) {
-      action.set_position(position);
-      action.set_promised(id);
-      action.set_performed(id);
-      action.set_type(Action::NOP);
-      action.mutable_nop();
-    } else {
-      action.set_performed(id);
-    }
-
-    Result<uint64_t> result = write(action, timeout);
-
-    if (result.isError()) {
-      return Error(result.error());
-    } else if (result.isNone()) {
-      return None();
-    } else {
-      CHECK_SOME(result);
-      return action;
-    }
+    return Future<Nothing>::failed("Coordinator demoted");
+  } else {
+    return Nothing();
   }
-
-  // Timed out ...
-  LOG(INFO) << "Coordinator timed out attempting to fill position "
-            << position << " in the log";
-  return None();
 }
 
 
-template <typename Req, typename Res>
-set<Future<Res> > Coordinator::broadcast(
-    const Protocol<Req, Res>& protocol,
-    const Req& req)
+Future<Nothing> CoordinatorProcess::runLearnPhase(const Action& action)
 {
-  Future<set<Future<Res> > > futures =
-    network->broadcast(protocol, req);
-  futures.await();
-  CHECK(futures.isReady());
-  return futures.get();
+  return log::learn(network, action);
 }
 
 
-template <typename Req, typename Res>
-set<Future<Res> > Coordinator::remotecast(
-    const Protocol<Req, Res>& protocol,
-    const Req& req)
+Future<bool> CoordinatorProcess::checkLearnPhase(const Action& action)
 {
-  set<UPID> filter;
-  filter.insert(replica->pid());
-  Future<set<Future<Res> > > futures =
-    network->broadcast(protocol, req, filter);
-  futures.await();
-  CHECK(futures.isReady());
-  return futures.get();
+  // Make sure that the local replica has learned the newly written
+  // log entry. Since messages are delivered and dispatched in order
+  // locally, we should always have the new entry learned by now.
+  return replica->missing(action.position());
 }
 
 
-template <typename M>
-void Coordinator::remotecast(const M& m)
+Future<uint64_t> CoordinatorProcess::updateIndexAfterWritten(bool missing)
 {
-  set<UPID> filter;
-  filter.insert(replica->pid());
-  network->broadcast(m, filter);
+  CHECK(!missing) << "Not expecting local replica to be missing position "
+                  << index << " after the writing is done";
+
+  return index++;
+}
+
+
+void CoordinatorProcess::writingFinished()
+{
+  CHECK_EQ(state, WRITING);
+  state = ELECTED;
+}
+
+
+void CoordinatorProcess::writingFailed()
+{
+  CHECK_EQ(state, WRITING);
+  state = INITIAL;
+}
+
+
+void CoordinatorProcess::writingAborted()
+{
+  CHECK_EQ(state, WRITING);
+  state = ELECTED;
+}
+
+
+/////////////////////////////////////////////////
+// Coordinator implementation.
+/////////////////////////////////////////////////
+
+
+Coordinator::Coordinator(
+    size_t quorum,
+    const Shared<Replica>& replica,
+    const Shared<Network>& network)
+{
+  process = new CoordinatorProcess(quorum, replica, network);
+  spawn(process);
+}
+
+
+Coordinator::~Coordinator()
+{
+  terminate(process);
+  process::wait(process);
+  delete process;
+}
+
+
+Future<Option<uint64_t> > Coordinator::elect()
+{
+  return dispatch(process, &CoordinatorProcess::elect);
+}
+
+
+Future<uint64_t> Coordinator::demote()
+{
+  return dispatch(process, &CoordinatorProcess::demote);
+}
+
+
+Future<uint64_t> Coordinator::append(const string& bytes)
+{
+  return dispatch(process, &CoordinatorProcess::append, bytes);
+}
+
+
+Future<uint64_t> Coordinator::truncate(uint64_t to)
+{
+  return dispatch(process, &CoordinatorProcess::truncate, to);
 }
 
 } // namespace log {
