@@ -12,7 +12,7 @@ Build-Depends:
  libtool, 
  dh-autoreconf, 
  python-setuptools, 
- python-protobuf (>= 2.4.1), 
+ python-protobuf (>= 2.5.0), 
  chrpath, 
  libsasl2-dev
 X-Python-Version: >= 2.6
