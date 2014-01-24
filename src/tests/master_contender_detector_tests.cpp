@@ -80,6 +80,19 @@ using testing::AtMost;
 using testing::Return;
 
 
+// Helper function that creates a MasterInfo from PID<Master>.
+static MasterInfo createMasterInfo(const PID<Master>& master)
+{
+  MasterInfo masterInfo;
+  masterInfo.set_id(UUID::random().toString());
+  masterInfo.set_ip(master.ip);
+  masterInfo.set_port(master.port);
+  masterInfo.set_pid(master);
+
+  return masterInfo;
+}
+
+
 class MasterContenderDetectorTest : public MesosTest {};
 
 
@@ -133,7 +146,7 @@ TEST(BasicMasterContenderDetectorTest, Contender)
 
   MasterContender* contender = new StandaloneMasterContender();
 
-  contender->initialize(master);
+  contender->initialize(createMasterInfo(master));
 
   Future<Future<Nothing> > contended = contender->contend();
   AWAIT_READY(contended);
@@ -190,7 +203,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterContender)
   master.ip = 10000000;
   master.port = 10000;
 
-  contender->initialize(master);
+  contender->initialize(createMasterInfo(master));
   Future<Future<Nothing> > contended = contender->contend();
   AWAIT_READY(contended);
 
@@ -228,7 +241,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderPendingElection)
   master.ip = 10000000;
   master.port = 10000;
 
-  contender.initialize(master);
+  contender.initialize(createMasterInfo(master));
 
   // Drop Group::join so that 'contended' will stay pending.
   Future<Nothing> join = DROP_DISPATCH(_, &GroupProcess::join);
@@ -281,7 +294,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterContenders)
   master1.ip = 10000000;
   master1.port = 10000;
 
-  contender1->initialize(master1);
+  contender1->initialize(createMasterInfo(master1));
 
   Future<Future<Nothing> > contended1 = contender1->contend();
   AWAIT_READY(contended1);
@@ -298,7 +311,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterContenders)
   master2.ip = 10000001;
   master2.port = 10001;
 
-  contender2.initialize(master2);
+  contender2.initialize(createMasterInfo(master2));
 
   Future<Future<Nothing> > contended2 = contender2.contend();
   AWAIT_READY(contended2);
@@ -343,7 +356,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, NonRetryableFrrors)
       "/mesos",
       zookeeper::Authentication("digest", "member:wrongpass")));
   ZooKeeperMasterContender contender(group2);
-  contender.initialize(master);
+  contender.initialize(createMasterInfo(master));
 
   // Fails due to authentication error.
   AWAIT_FAILED(contender.contend());
@@ -399,7 +412,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderDetectorShutdownNetwork)
   master.ip = 10000000;
   master.port = 10000;
 
-  contender.initialize(master);
+  contender.initialize(createMasterInfo(master));
 
   Future<Future<Nothing> > contended = contender.contend();
   AWAIT_READY(contended);
@@ -418,7 +431,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderDetectorShutdownNetwork)
 
   // We may need to advance multiple times because we could have
   // advanced the clock before the timer in Group starts.
-  while (lostCandidacy.isPending()) {
+  while (lostCandidacy.isPending() || leader.isPending()) {
     Clock::advance(MASTER_CONTENDER_ZK_SESSION_TIMEOUT);
     Clock::settle();
   }
@@ -426,9 +439,11 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderDetectorShutdownNetwork)
   // Local timeout does not fail the future but rather deems the
   // session has timed out and the candidacy is lost.
   EXPECT_TRUE(lostCandidacy.isReady());
+  EXPECT_NONE(leader.get());
 
-  // Re-contend (and continue detecting).
+  // Re-contend and re-detect.
   contended = contender.contend();
+  leader = detector.detect(leader.get());
 
   // Things will not change until the server restarts.
   Clock::advance(Minutes(1));
@@ -472,7 +487,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterDetectorTimedoutSession)
   leader.ip = 10000000;
   leader.port = 10000;
 
-  leaderContender.initialize(leader);
+  leaderContender.initialize(createMasterInfo(leader));
 
   Future<Future<Nothing> > contended = leaderContender.contend();
   AWAIT_READY(contended);
@@ -492,7 +507,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterDetectorTimedoutSession)
   follower.ip = 10000001;
   follower.port = 10001;
 
-  followerContender.initialize(follower);
+  followerContender.initialize(createMasterInfo(follower));
 
   contended = followerContender.contend();
   AWAIT_READY(contended);
@@ -540,19 +555,23 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterDetectorTimedoutSession)
 
   Clock::pause();
 
-  // We know when the groups have timed out when the contenders are
-  // informed of the candidacy loss.
   // We may need to advance multiple times because we could have
   // advanced the clock before the timer in Group starts.
-  while (leaderLostCandidacy.isPending() || followerLostCandidacy.isPending()) {
+  while (leaderDetected.isPending() ||
+         followerDetected.isPending() ||
+         nonContenderDetected.isPending() ||
+         leaderLostCandidacy.isPending() ||
+         followerLostCandidacy.isPending()) {
     Clock::advance(sessionTimeout);
     Clock::settle();
   }
 
-  // Detection is not interrupted.
-  EXPECT_TRUE(leaderDetected.isPending());
-  EXPECT_TRUE(followerDetected.isPending());
-  EXPECT_TRUE(nonContenderDetected.isPending());
+  EXPECT_NONE(leaderDetected.get());
+  EXPECT_NONE(followerDetected.get());
+  EXPECT_NONE(nonContenderDetected.get());
+
+  EXPECT_TRUE(leaderLostCandidacy.isReady());
+  EXPECT_TRUE(followerLostCandidacy.isReady());
 
   Clock::resume();
 }
@@ -580,7 +599,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest,
 
   ZooKeeperMasterContender leaderContender(group);
 
-  leaderContender.initialize(leader);
+  leaderContender.initialize(createMasterInfo(leader));
 
   Future<Future<Nothing> > leaderContended = leaderContender.contend();
   AWAIT_READY(leaderContended);
@@ -604,7 +623,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest,
 
   ZooKeeperMasterDetector followerDetector(url.get());
   ZooKeeperMasterContender followerContender(url.get());
-  followerContender.initialize(follower);
+  followerContender.initialize(createMasterInfo(follower));
 
   Future<Future<Nothing> > followerContended = followerContender.contend();
   AWAIT_READY(followerContended);
@@ -649,7 +668,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterDetectorExpireSlaveZKSession)
   master.port = 10000;
 
   ZooKeeperMasterContender masterContender(url.get());
-  masterContender.initialize(master);
+  masterContender.initialize(createMasterInfo(master));
 
   Future<Future<Nothing> > leaderContended = masterContender.contend();
   AWAIT_READY(leaderContended);
@@ -670,18 +689,18 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, MasterDetectorExpireSlaveZKSession)
   Future<Option<int64_t> > session = group->session();
   AWAIT_READY(session);
 
-  Future<Nothing> connected = FUTURE_DISPATCH(
-      group->process->self(),
-      &GroupProcess::connected);
-
   server->expireSession(session.get().get());
 
-  // When connected is called, the leader has already expired and
-  // reconnected.
-  AWAIT_READY(connected);
+  // Session expiration causes detector to assume all membership are
+  // lost.
+  AWAIT_READY(detected);
+  EXPECT_NONE(detected.get());
 
-  // Still pending because there is no leader change.
-  EXPECT_TRUE(detected.isPending());
+  detected = slaveDetector.detect(detected.get());
+
+  // The detector is able re-detect the master.
+  AWAIT_READY(detected);
+  EXPECT_SOME_EQ(master, detected.get());
 }
 
 
@@ -708,7 +727,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest,
   leader.ip = 10000000;
   leader.port = 10000;
 
-  leaderContender.initialize(leader);
+  leaderContender.initialize(createMasterInfo(leader));
 
   Future<Future<Nothing> > contended = leaderContender.contend();
   AWAIT_READY(contended);
@@ -727,7 +746,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest,
   follower.ip = 10000001;
   follower.port = 10001;
 
-  followerContender.initialize(follower);
+  followerContender.initialize(createMasterInfo(follower));
 
   contended = followerContender.contend();
   AWAIT_READY(contended);
@@ -758,9 +777,14 @@ TEST_F(ZooKeeperMasterContenderDetectorTest,
   server->expireSession(slaveSession.get().get());
   server->expireSession(masterSession.get().get());
 
-  // Wait for session expiration and ensure a new master is detected.
+  // Wait for session expiration and the detector will first receive
+  // a "no master detected" event.
   AWAIT_READY(detected);
+  EXPECT_NONE(detected.get());
 
+  // nonContenderDetector can now re-detect the new master.
+  detected = nonContenderDetector.detect(detected.get());
+  AWAIT_READY(detected);
   EXPECT_SOME_EQ(follower, detected.get());
 }
 

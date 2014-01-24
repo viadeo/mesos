@@ -29,6 +29,8 @@
 #include <stout/gtest.hpp>
 #include <stout/strings.hpp>
 
+#include "master/constants.hpp"
+
 #include "zookeeper/authentication.hpp"
 #include "zookeeper/contender.hpp"
 #include "zookeeper/detector.hpp"
@@ -203,7 +205,6 @@ TEST_F(ZooKeeperTest, LeaderDetectorTimeoutHandling)
 
   Future<Group::Membership> membership1 = group.join("member 1");
   AWAIT_READY(membership1);
-  Future<bool> cancelled = membership1.get().cancelled();
 
   Future<Option<Group::Membership> > leader = detector.detect();
 
@@ -218,26 +219,33 @@ TEST_F(ZooKeeperTest, LeaderDetectorTimeoutHandling)
 
   // We may need to advance multiple times because we could have
   // advanced the clock before the timer in Group starts.
-  while (cancelled.isPending()) {
+  while (leader.isPending()) {
     Clock::advance(timeout);
     Clock::settle();
   }
   Clock::resume();
 
-  // The detect operation times out but the group internally
-  // recreates a new ZooKeeper client and hides the error from the
-  // detector.
-  EXPECT_TRUE(leader.isPending());
+  // The detect operation times out.
+  EXPECT_NONE(leader.get());
+
+  // Re-detect.
+  leader = detector.detect(leader.get());
 
   Future<Nothing> connected = FUTURE_DISPATCH(
       group.process->self(),
       &GroupProcess::connected);
   server->startNetwork();
 
-  // When the service is restored, all sessions/memberships are gone.
   AWAIT_READY(connected);
   AWAIT_READY(leader);
-  EXPECT_TRUE(leader.get().isNone());
+  EXPECT_SOME(leader.get());
+
+  // Wait until the old membership expires on ZK and re-detect.
+  // (Restarting network doesn't delete old ZNode automatically).
+  AWAIT_READY(leader.get().get().cancelled());
+  leader = detector.detect(leader.get());
+  AWAIT_READY(leader);
+  EXPECT_NONE(leader.get());
 
   AWAIT_READY(group.join("member 1"));
 
@@ -246,10 +254,12 @@ TEST_F(ZooKeeperTest, LeaderDetectorTimeoutHandling)
   EXPECT_SOME(leader.get());
 
   // Cancel the member and join another.
-  AWAIT_READY(group.cancel(leader.get().get()));
+  Future<bool> cancelled = group.cancel(leader.get().get());
+  AWAIT_READY(cancelled);
+  EXPECT_TRUE(cancelled.get());
   leader = detector.detect(leader.get());
   AWAIT_READY(leader);
-  EXPECT_TRUE(leader.get().isNone());
+  EXPECT_NONE(leader.get());
 
   AWAIT_READY(group.join("member 2"));
 
@@ -266,7 +276,7 @@ TEST_F(ZooKeeperTest, LeaderContender)
   Group group(server->connectString(), timeout, "/test/");
 
   Owned<LeaderContender> contender(
-      new LeaderContender(&group, "candidate 1"));
+      new LeaderContender(&group, "candidate 1", master::MASTER_INFO_LABEL));
 
   // Calling withdraw before contending returns 'false' because there
   // is nothing to withdraw.
@@ -284,7 +294,7 @@ TEST_F(ZooKeeperTest, LeaderContender)
 
   // Normal workflow.
   contender = Owned<LeaderContender>(
-      new LeaderContender(&group, "candidate 1"));
+      new LeaderContender(&group, "candidate 1", master::MASTER_INFO_LABEL));
 
   Future<Future<Nothing> > candidated = contender->contend();
   AWAIT_READY(candidated);
@@ -312,7 +322,7 @@ TEST_F(ZooKeeperTest, LeaderContender)
 
   // Contend again.
   contender = Owned<LeaderContender>(
-      new LeaderContender(&group, "candidate 1"));
+      new LeaderContender(&group, "candidate 1", master::MASTER_INFO_LABEL));
   candidated = contender->contend();
 
   AWAIT_READY(connected);
@@ -336,7 +346,7 @@ TEST_F(ZooKeeperTest, LeaderContender)
 
   // Contend (3) and shutdown the network this time.
   contender = Owned<LeaderContender>(
-      new LeaderContender(&group, "candidate 1"));
+      new LeaderContender(&group, "candidate 1", master::MASTER_INFO_LABEL));
   candidated = contender->contend();
   AWAIT_READY(candidated);
   lostCandidacy = candidated.get();
@@ -361,7 +371,7 @@ TEST_F(ZooKeeperTest, LeaderContender)
 
   // Contend again (4).
   contender = Owned<LeaderContender>(
-      new LeaderContender(&group, "candidate 1"));
+      new LeaderContender(&group, "candidate 1", master::MASTER_INFO_LABEL));
   candidated = contender->contend();
   AWAIT_READY(candidated);
 }

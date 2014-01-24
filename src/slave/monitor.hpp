@@ -21,10 +21,15 @@
 
 #include <string>
 
+#include <boost/circular_buffer.hpp>
+
 #include <mesos/mesos.hpp>
 
 #include <process/future.hpp>
+#include <process/limiter.hpp>
+#include <process/statistics.hpp>
 
+#include <stout/cache.hpp>
 #include <stout/duration.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/nothing.hpp>
@@ -42,13 +47,16 @@ class Isolator;
 class ResourceMonitorProcess;
 
 
+const extern Duration MONITORING_TIME_SERIES_WINDOW;
+const extern size_t MONITORING_TIME_SERIES_CAPACITY;
+
+// Number of time series to maintain for completed executors.
+const extern size_t MONITORING_ARCHIVED_TIME_SERIES;
+
+
 // Provides resource monitoring for executors. Resource usage time
 // series are stored using the Statistics module. Usage information
 // is also exported via a JSON endpoint.
-// TODO(bmahler): Once the deprecated usage.json endpoint is removed,
-// clean this up!! It will be possible to drive collection directly
-// via the http endpoints, and the isolator can return all
-// information in one request.
 // TODO(bmahler): Forward usage information to the master.
 // TODO(bmahler): Consider pulling out the resource collection into
 // a Collector abstraction. The monitor can then become a true
@@ -86,7 +94,10 @@ class ResourceMonitorProcess : public process::Process<ResourceMonitorProcess>
 {
 public:
   ResourceMonitorProcess(Isolator* _isolator)
-    : ProcessBase("monitor"), isolator(_isolator) {}
+    : ProcessBase("monitor"),
+      isolator(_isolator),
+      limiter(2, Seconds(1)), // 2 permits per second.
+      archive(MONITORING_ARCHIVED_TIME_SERIES) {}
 
   virtual ~ResourceMonitorProcess() {}
 
@@ -103,8 +114,13 @@ public:
 protected:
   virtual void initialize()
   {
-    route("/statistics.json", None(), &ResourceMonitorProcess::statisticsJSON);
-    route("/usage.json", None(), &ResourceMonitorProcess::usage);
+    route("/statistics.json",
+          STATISTICS_HELP,
+          &ResourceMonitorProcess::statistics);
+
+    // TODO(bmahler): Add a archive.json endpoint that exposes
+    // historical information, once we have path parameters for
+    // routes.
   }
 
 private:
@@ -112,26 +128,60 @@ private:
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const Duration& interval);
-
   void _collect(
       const process::Future<ResourceStatistics>& statistics,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const Duration& interval);
 
+  // This is a convenience struct for bundling usage information.
+  struct Usage
+  {
+    FrameworkID frameworkId;
+    ExecutorInfo executorInfo;
+    process::Future<ResourceStatistics> statistics;
+  };
+
+  // Helper for returning the usage for a particular executor.
+  Usage usage(
+      const FrameworkID& frameworkId,
+      const ExecutorInfo& executorInfo);
+
+  // HTTP Endpoints.
   // Returns the monitoring statistics. Requests have no parameters.
-  process::Future<process::http::Response> statisticsJSON(
+  process::Future<process::http::Response> statistics(
+      const process::http::Request& request);
+  process::Future<process::http::Response> _statistics(
+      const process::http::Request& request);
+  process::Future<process::http::Response> __statistics(
+      const std::list<Usage>& usages,
       const process::http::Request& request);
 
-  // TODO(bmahler): Deprecated.
-  // Returns the usage information. Requests have no parameters.
-  process::Future<process::http::Response> usage(
-      const process::http::Request& request);
+  static const std::string STATISTICS_HELP;
 
   Isolator* isolator;
 
-  // The executor info is stored for each watched executor.
-  hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo> > watches;
+  // Used to rate limit the statistics.json endpoint.
+  process::RateLimiter limiter;
+
+  // Monitoring information for an executor.
+  struct MonitoringInfo {
+    // boost::circular_buffer needs a default constructor.
+    MonitoringInfo() {}
+
+    MonitoringInfo(const ExecutorInfo& _executorInfo,
+                   const Duration& window,
+                   size_t capacity)
+      : executorInfo(_executorInfo), statistics(window, capacity) {}
+
+    ExecutorInfo executorInfo;   // Non-const for assignability.
+    process::TimeSeries<ResourceStatistics> statistics;
+  };
+
+  hashmap<FrameworkID, hashmap<ExecutorID, MonitoringInfo> > executors;
+
+  // Fixed-size history of monitoring information.
+  boost::circular_buffer<MonitoringInfo> archive;
 };
 
 } // namespace slave {

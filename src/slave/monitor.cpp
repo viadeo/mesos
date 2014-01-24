@@ -16,29 +16,33 @@
  * limitations under the License.
  */
 
+#include <list>
 #include <map>
 #include <string>
 
 #include <mesos/mesos.hpp>
 
 #include <process/clock.hpp>
+#include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
 #include <process/future.hpp>
+#include <process/help.hpp>
 #include <process/http.hpp>
 #include <process/process.hpp>
 #include <process/statistics.hpp>
 
 #include <stout/json.hpp>
 #include <stout/lambda.hpp>
+#include <stout/protobuf.hpp>
 
 #include "slave/isolator.hpp"
 #include "slave/monitor.hpp"
 
 using namespace process;
 
-using process::statistics;
-
+using std::list;
+using std::make_pair;
 using std::map;
 using std::string;
 
@@ -48,45 +52,13 @@ namespace slave {
 
 using process::wait; // Necessary on some OS's to disambiguate.
 
-// Resource statistics constants.
-// These match the names in the ResourceStatistics protobuf.
-// TODO(bmahler): Later, when we have a richer monitoring story,
-// we will want to publish these outside of this file.
-// TODO(cdel): Check if we need any more of the cgroup stats.
-const std::string CPUS_TIME_SECS        = "cpus_time_secs";
-const std::string CPUS_USER_TIME_SECS   = "cpus_user_time_secs";
-const std::string CPUS_SYSTEM_TIME_SECS = "cpus_system_time_secs";
-const std::string CPUS_LIMIT            = "cpus_limit";
-const std::string MEM_RSS_BYTES         = "mem_rss_bytes";
-const std::string MEM_LIMIT_BYTES       = "mem_limit_bytes";
-const std::string MEM_FILE_BYTES        = "mem_file_bytes";
-const std::string MEM_ANON_BYTES        = "mem_anon_bytes";
-const std::string MEM_MAPPED_FILE_BYTES = "mem_mapped_file_bytes";
-const std::string CPUS_NR_PERIODS       = "cpus_nr_periods";
-const std::string CPUS_NR_THROTTLED     = "cpus_nr_throttled";
-const std::string CPUS_THROTTLED_TIME_SECS = "cpus_throttled_time_secs";
 
-// TODO(bmahler): Deprecated statistical names, these will be removed!
-const std::string CPU_TIME   = "cpu_time";
-const std::string CPU_USAGE  = "cpu_usage";
-const std::string MEMORY_RSS = "memory_rss";
+// TODO(bmahler): Consider exposing these as flags should the
+// need arise. These are conservative for the initial version.
+const Duration MONITORING_TIME_SERIES_WINDOW = Weeks(2);
+const size_t MONITORING_TIME_SERIES_CAPACITY = 1000;
+const size_t MONITORING_ARCHIVED_TIME_SERIES = 25;
 
-
-// Local function prototypes.
-void publish(
-    const FrameworkID& frameworkId,
-    const ExecutorID& executorId,
-    const ResourceStatistics& statistics);
-
-Future<http::Response> _statisticsJSON(
-    const hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo> >& executors,
-    const map<string, double>& statistics,
-    const Option<string>& jsonp);
-
-Future<http::Response> _usage(
-    const hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo> >& executors,
-    const map<string, double>& statistics,
-    const Option<string>& jsonp);
 
 Future<Nothing> ResourceMonitorProcess::watch(
     const FrameworkID& frameworkId,
@@ -94,21 +66,15 @@ Future<Nothing> ResourceMonitorProcess::watch(
     const ExecutorInfo& executorInfo,
     const Duration& interval)
 {
-  if (watches.contains(frameworkId) &&
-      watches[frameworkId].contains(executorId)) {
+  if (executors.contains(frameworkId) &&
+      executors[frameworkId].contains(executorId)) {
     return Failure("Already watched");
   }
 
-  watches[frameworkId][executorId] = executorInfo;
-
-  // Set up the cpu usage meter prior to collecting.
-  const string& prefix =
-    strings::join("/", frameworkId.value(), executorId.value(), "");
-
-  ::statistics->meter(
-      "monitor",
-      prefix + CPUS_TIME_SECS,
-      Owned<meters::Meter>(new meters::TimeRate(prefix + CPU_USAGE)));
+  executors[frameworkId][executorId] =
+      MonitoringInfo(executorInfo,
+                     MONITORING_TIME_SERIES_WINDOW,
+                     MONITORING_TIME_SERIES_CAPACITY);
 
   // Schedule the resource collection.
   delay(interval, self(), &Self::collect, frameworkId, executorId, interval);
@@ -121,34 +87,17 @@ Future<Nothing> ResourceMonitorProcess::unwatch(
     const FrameworkID& frameworkId,
     const ExecutorID& executorId)
 {
-  const string& prefix =
-    strings::join("/", frameworkId.value(), executorId.value(), "");
-
-  // In case we've already noticed the executor was terminated,
-  // we need to archive the statistics first.
-  // No need to archive CPUS_USAGE as it is implicitly archived along
-  // with CPUS_TIME_SECS.
-  ::statistics->archive("monitor", prefix + CPUS_USER_TIME_SECS);
-  ::statistics->archive("monitor", prefix + CPUS_SYSTEM_TIME_SECS);
-  ::statistics->archive("monitor", prefix + CPUS_LIMIT);
-  ::statistics->archive("monitor", prefix + MEM_RSS_BYTES);
-  ::statistics->archive("monitor", prefix + MEM_LIMIT_BYTES);
-  ::statistics->archive("monitor", prefix + MEM_FILE_BYTES);
-  ::statistics->archive("monitor", prefix + MEM_ANON_BYTES);
-  ::statistics->archive("monitor", prefix + MEM_MAPPED_FILE_BYTES);
-  ::statistics->archive("monitor", prefix + CPUS_NR_PERIODS);
-  ::statistics->archive("monitor", prefix + CPUS_NR_THROTTLED);
-  ::statistics->archive("monitor", prefix + CPUS_THROTTLED_TIME_SECS);
-
-  if (!watches.contains(frameworkId) ||
-      !watches[frameworkId].contains(executorId)) {
+  if (!executors.contains(frameworkId) ||
+      !executors[frameworkId].contains(executorId)) {
     return Failure("Not watched");
   }
 
-  watches[frameworkId].erase(executorId);
+  // Add the monitoring information to the archive.
+  archive.push_back(executors[frameworkId][executorId]);
+  executors[frameworkId].erase(executorId);
 
-  if (watches[frameworkId].empty()) {
-    watches.erase(frameworkId);
+  if (executors[frameworkId].empty()) {
+    executors.erase(frameworkId);
   }
 
   return Nothing();
@@ -161,8 +110,8 @@ void ResourceMonitorProcess::collect(
     const Duration& interval)
 {
   // Has the executor been unwatched?
-  if (!watches.contains(frameworkId) ||
-      !watches[frameworkId].contains(executorId)) {
+  if (!executors.contains(frameworkId) ||
+      !executors[frameworkId].contains(executorId)) {
     return;
   }
 
@@ -183,23 +132,35 @@ void ResourceMonitorProcess::_collect(
     const Duration& interval)
 {
   // Has the executor been unwatched?
-  if (!watches.contains(frameworkId) ||
-      !watches[frameworkId].contains(executorId)) {
+  if (!executors.contains(frameworkId) ||
+      !executors[frameworkId].contains(executorId)) {
     return;
   }
 
-  if (statistics.isReady()) {
-    // Publish the data to the statistics module.
-    VLOG(1) << "Publishing resource usage for executor '" << executorId
+  if (statistics.isDiscarded()) {
+    // Note that the isolator may have terminated, causing pending
+    // dispatches to be deleted.
+    VLOG(1) << "Ignoring discarded future collecting resource usage for "
+            << "executor '" << executorId
             << "' of framework '" << frameworkId << "'";
-    publish(frameworkId, executorId, statistics.get());
-  } else {
-    // Note that the isolator might have been terminated and pending
-    // dispatches deleted, causing the future to get discarded.
+  } else if (statistics.isFailed()) {
+    // TODO(bmahler): Have the Isolators discard the result when the
+    // executor was killed or completed.
     VLOG(1)
       << "Failed to collect resource usage for executor '" << executorId
-      << "' of framework '" << frameworkId << "': "
-      << (statistics.isFailed() ? statistics.failure() : "Future discarded");
+      << "' of framework '" << frameworkId << "': " << statistics.failure();
+  } else {
+    Try<Time> time = Time::create(statistics.get().timestamp());
+
+    if (time.isError()) {
+      LOG(ERROR) << "Invalid timestamp " << statistics.get().timestamp()
+                 << " for executor '" << executorId
+                 << "' of framework '" << frameworkId << ": " << time.error();
+    } else {
+      // Add the statistics to the time series.
+      executors[frameworkId][executorId].statistics.set(
+          statistics.get(), time.get());
+    }
   }
 
   // Schedule the next collection.
@@ -207,261 +168,112 @@ void ResourceMonitorProcess::_collect(
 }
 
 
-// TODO(bmahler): With slave recovery, executor uuid's will be exposed
-// to the isolator. This means that we will be able to publish
-// statistics per executor run, rather than across all runs.
-void publish(
+ResourceMonitorProcess::Usage ResourceMonitorProcess::usage(
     const FrameworkID& frameworkId,
-    const ExecutorID& executorId,
-    const ResourceStatistics& statistics)
+    const ExecutorInfo& executorInfo)
 {
-  Try<Time> time_ = Time::create(statistics.timestamp());
-  if (time_.isError()) {
-    LOG(ERROR) << "Not publishing the statistics because we cannot create a "
-               << "Duration from its timestamp: " << time_.error();
-    return;
-  }
+  Usage usage;
+  usage.frameworkId = frameworkId;
+  usage.executorInfo = executorInfo;
+  usage.statistics = dispatch(
+      isolator, &Isolator::usage, frameworkId, executorInfo.executor_id());
 
-  Time time = time_.get();
-
-  const string& prefix =
-    strings::join("/", frameworkId.value(), executorId.value(), "");
-
-  // Publish cpu usage statistics.
-  ::statistics->set(
-      "monitor",
-      prefix + CPUS_USER_TIME_SECS,
-      statistics.cpus_user_time_secs(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + CPUS_SYSTEM_TIME_SECS,
-      statistics.cpus_system_time_secs(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + CPUS_LIMIT,
-      statistics.cpus_limit(),
-      time);
-  // The applied meter from watch() will publish the cpu usage.
-  ::statistics->set(
-      "monitor",
-      prefix + CPUS_TIME_SECS,
-      statistics.cpus_user_time_secs() + statistics.cpus_system_time_secs(),
-      time);
-
-  // Publish memory statistics.
-  ::statistics->set(
-      "monitor",
-      prefix + MEM_RSS_BYTES,
-      statistics.mem_rss_bytes(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + MEM_LIMIT_BYTES,
-      statistics.mem_limit_bytes(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + MEM_FILE_BYTES,
-      statistics.mem_file_bytes(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + MEM_ANON_BYTES,
-      statistics.mem_anon_bytes(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + MEM_MAPPED_FILE_BYTES,
-      statistics.mem_mapped_file_bytes(),
-      time);
-
-  // Publish cpu.stat statistics.
-  ::statistics->set(
-      "monitor",
-      prefix + CPUS_NR_PERIODS,
-      statistics.cpus_nr_periods(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + CPUS_NR_THROTTLED,
-      statistics.cpus_nr_throttled(),
-      time);
-  ::statistics->set(
-      "monitor",
-      prefix + CPUS_THROTTLED_TIME_SECS,
-      statistics.cpus_throttled_time_secs(),
-      time);
+  return usage;
 }
 
 
-Future<http::Response> ResourceMonitorProcess::statisticsJSON(
+Future<http::Response> ResourceMonitorProcess::statistics(
     const http::Request& request)
 {
-  lambda::function<Future<http::Response>(const map<string, double>&)>
-    _statisticsJSON = lambda::bind(
-      slave::_statisticsJSON,
-      watches,
-      lambda::_1,
-      request.query.get("jsonp"));
-
-  return ::statistics->get("monitor").then(_statisticsJSON);
+  return limiter.acquire()
+    .then(defer(self(), &Self::_statistics, request));
 }
 
 
-Future<http::Response> _statisticsJSON(
-    const hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo> >& watches,
-    const map<string, double>& statistics,
-    const Option<string>& jsonp)
+Future<http::Response> ResourceMonitorProcess::_statistics(
+    const http::Request& request)
 {
-  JSON::Array result;
+  list<Usage> usages;
+  list<Future<ResourceStatistics> > futures;
 
-  foreachkey (const FrameworkID& frameworkId, watches) {
-    foreachkey (const ExecutorID& executorId, watches.get(frameworkId).get()) {
-      const ExecutorInfo& info =
-        watches.get(frameworkId).get().get(executorId).get();
-      const string& prefix =
-        strings::join("/", frameworkId.value(), executorId.value(), "");
-
-      // Export zero values by default.
-      JSON::Object usage;
-      usage.values[CPUS_USER_TIME_SECS] = 0;
-      usage.values[CPUS_SYSTEM_TIME_SECS] = 0;
-      usage.values[CPUS_LIMIT] = 0;
-      usage.values[MEM_RSS_BYTES] = 0;
-      usage.values[MEM_LIMIT_BYTES] = 0;
-      usage.values[MEM_FILE_BYTES] = 0;
-      usage.values[MEM_ANON_BYTES] = 0;
-      usage.values[MEM_MAPPED_FILE_BYTES] = 0;
-      usage.values[CPUS_NR_PERIODS] = 0;
-      usage.values[CPUS_NR_THROTTLED] = 0;
-      usage.values[CPUS_THROTTLED_TIME_SECS] = 0;
-
-      // Set the cpu usage data if present.
-      if (statistics.count(prefix + CPUS_USER_TIME_SECS) > 0) {
-        usage.values[CPUS_USER_TIME_SECS] =
-          statistics.find(prefix + CPUS_USER_TIME_SECS)->second;
-      }
-      if (statistics.count(prefix + CPUS_SYSTEM_TIME_SECS) > 0) {
-        usage.values[CPUS_SYSTEM_TIME_SECS] =
-          statistics.find(prefix + CPUS_SYSTEM_TIME_SECS)->second;
-      }
-      if (statistics.count(prefix + CPUS_LIMIT) > 0) {
-        usage.values[CPUS_LIMIT] = statistics.find(prefix + CPUS_LIMIT)->second;
-      }
-
-      // Set the memory usage data if present.
-      if (statistics.count(prefix + MEM_RSS_BYTES) > 0) {
-        usage.values[MEM_RSS_BYTES] =
-          statistics.find(prefix + MEM_RSS_BYTES)->second;
-      }
-      if (statistics.count(prefix + MEM_LIMIT_BYTES) > 0) {
-        usage.values[MEM_LIMIT_BYTES] =
-          statistics.find(prefix + MEM_LIMIT_BYTES)->second;
-      }
-      if (statistics.count(prefix + MEM_FILE_BYTES) > 0) {
-        usage.values[MEM_FILE_BYTES] =
-          statistics.find(prefix + MEM_FILE_BYTES)->second;
-      }
-      if (statistics.count(prefix + MEM_ANON_BYTES) > 0) {
-        usage.values[MEM_ANON_BYTES] =
-          statistics.find(prefix + MEM_ANON_BYTES)->second;
-      }
-      if (statistics.count(prefix + MEM_MAPPED_FILE_BYTES) > 0) {
-        usage.values[MEM_MAPPED_FILE_BYTES] =
-          statistics.find(prefix + MEM_MAPPED_FILE_BYTES)->second;
-      }
-
-      // Set the cpu.stat data if present.
-      if (statistics.count(prefix + CPUS_NR_PERIODS) > 0) {
-        usage.values[CPUS_NR_PERIODS] =
-          statistics.find(prefix + CPUS_NR_PERIODS)->second;
-      }
-      if (statistics.count(prefix + CPUS_NR_THROTTLED) > 0) {
-        usage.values[CPUS_NR_THROTTLED] =
-          statistics.find(prefix + CPUS_NR_THROTTLED)->second;
-      }
-      if (statistics.count(prefix + CPUS_THROTTLED_TIME_SECS) > 0) {
-        usage.values[CPUS_THROTTLED_TIME_SECS] =
-          statistics.find(prefix + CPUS_THROTTLED_TIME_SECS)->second;
-      }
-
-      JSON::Object entry;
-      entry.values["framework_id"] = frameworkId.value();
-      entry.values["executor_id"] = executorId.value();
-      entry.values["executor_name"] = info.name();
-      entry.values["source"] = info.source();
-      entry.values["statistics"] = usage;
-
-      result.values.push_back(entry);
+  foreachkey (const FrameworkID& frameworkId, executors) {
+    foreachvalue (const MonitoringInfo& info, executors[frameworkId]) {
+      // TODO(bmahler): Consider a batch usage API on the Isolator.
+      usages.push_back(usage(frameworkId, info.executorInfo));
+      futures.push_back(usages.back().statistics);
     }
   }
 
-  return http::OK(result, jsonp);
+  return process::await(futures)
+    .then(defer(self(), &Self::__statistics, usages, request));
 }
 
 
-Future<http::Response> ResourceMonitorProcess::usage(
+Future<http::Response> ResourceMonitorProcess::__statistics(
+    const list<ResourceMonitorProcess::Usage>& usages,
     const http::Request& request)
-{
-  lambda::function<Future<http::Response>(const map<string, double>&)>
-    _usage = lambda::bind(
-      slave::_usage,
-      watches,
-      lambda::_1,
-      request.query.get("jsonp"));
-
-  return ::statistics->get("monitor").then(_usage);
-}
-
-
-Future<http::Response> _usage(
-    const hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo> >& watches,
-    const map<string, double>& statistics,
-    const Option<string>& jsonp)
 {
   JSON::Array result;
 
-  foreachkey (const FrameworkID& frameworkId, watches) {
-    foreachkey (const ExecutorID& executorId, watches.get(frameworkId).get()) {
-      const ExecutorInfo& info =
-        watches.get(frameworkId).get().get(executorId).get();
-      const string& prefix =
-        strings::join("/", frameworkId.value(), executorId.value(), "");
-
-      // Export zero values by default.
-      JSON::Object usage;
-      usage.values[CPU_USAGE] = 0;
-      usage.values[CPU_TIME] = 0;
-      usage.values[MEMORY_RSS] = 0;
-
-      // Set the usage data if present.
-      if (statistics.count(prefix + CPU_USAGE) > 0) {
-        usage.values[CPU_USAGE] = statistics.find(prefix + CPU_USAGE)->second;
-      }
-      if (statistics.count(prefix + CPUS_TIME_SECS) > 0) {
-        usage.values[CPU_TIME] =
-          statistics.find(prefix + CPUS_TIME_SECS)->second;
-      }
-      if (statistics.count(prefix + MEM_RSS_BYTES) > 0) {
-        usage.values[MEMORY_RSS] =
-          statistics.find(prefix + MEM_RSS_BYTES)->second;
-      }
-
-      JSON::Object entry;
-      entry.values["framework_id"] = frameworkId.value();
-      entry.values["executor_id"] = executorId.value();
-      entry.values["executor_name"] = info.name();
-      entry.values["source"] = info.source();
-      entry.values["resource_usage"] = usage;
-
-      result.values.push_back(entry);
+  foreach (const Usage& usage, usages) {
+    if (usage.statistics.isFailed()) {
+      LOG(WARNING) << "Failed to get resource usage for executor "
+                   << usage.executorInfo.executor_id()
+                   << " of framework " << usage.frameworkId
+                   << ": " << usage.statistics.failure();
+      continue;
+    } else if (usage.statistics.isDiscarded()) {
+      continue;
     }
+
+    JSON::Object entry;
+    entry.values["framework_id"] = usage.frameworkId.value();
+    entry.values["executor_id"] = usage.executorInfo.executor_id().value();
+    entry.values["executor_name"] = usage.executorInfo.name();
+    entry.values["source"] = usage.executorInfo.source();
+    entry.values["statistics"] = JSON::Protobuf(usage.statistics.get());
+
+    result.values.push_back(entry);
   }
 
-  return http::OK(result, jsonp);
+  return http::OK(result, request.query.get("jsonp"));
 }
+
+
+const string ResourceMonitorProcess::STATISTICS_HELP = HELP(
+    TLDR(
+        "Retrieve resource monitoring information."),
+    USAGE(
+        "/statistics.json"),
+    DESCRIPTION(
+        "Returns the current resource consumption data for executors",
+        "running under this slave.",
+        "",
+        "Example:",
+        "",
+        "```",
+        "[{",
+        "    \"executor_id\":\"executor\",",
+        "    \"executor_name\":\"name\",",
+        "    \"framework_id\":\"framework\",",
+        "    \"source\":\"source\",",
+        "    \"statistics\":",
+        "    {",
+        "        \"cpus_limit\":8.25,",
+        "        \"cpus_nr_periods\":769021,",
+        "        \"cpus_nr_throttled\":1046,",
+        "        \"cpus_system_time_secs\":34501.45,",
+        "        \"cpus_throttled_time_secs\":352.597023453,",
+        "        \"cpus_user_time_secs\":96348.84,",
+        "        \"mem_anon_bytes\":4845449216,",
+        "        \"mem_file_bytes\":260165632,",
+        "        \"mem_limit_bytes\":7650410496,",
+        "        \"mem_mapped_file_bytes\":7159808,",
+        "        \"mem_rss_bytes\":5105614848,",
+        "        \"timestamp\":1388534400.0",
+        "    }",
+        "}]",
+        "```"));
 
 
 ResourceMonitor::ResourceMonitor(Isolator* isolator)
