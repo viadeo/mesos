@@ -21,6 +21,7 @@
 #include <process/collect.hpp>
 #include <process/id.hpp>
 #include <process/process.hpp>
+#include <process/timer.hpp>
 
 #include <stout/lambda.hpp>
 #include <stout/stringify.hpp>
@@ -173,12 +174,14 @@ public:
       const Shared<Replica>& _replica,
       const Shared<Network>& _network,
       uint64_t _proposal,
-      const set<uint64_t>& _positions)
+      const set<uint64_t>& _positions,
+      const Duration& _timeout)
     : ProcessBase(ID::generate("log-bulk-catch-up")),
       quorum(_quorum),
       replica(_replica),
       network(_network),
       positions(_positions),
+      timeout(_timeout),
       proposal(_proposal) {}
 
   virtual ~BulkCatchUpProcess() {}
@@ -204,6 +207,11 @@ protected:
   }
 
 private:
+  static void timedout(Future<uint64_t> catching)
+  {
+    catching.discard();
+  }
+
   void catchup()
   {
     if (it == positions.end()) {
@@ -214,23 +222,33 @@ private:
 
     // Store the future so that we can discard it if the user wants to
     // cancel the catch-up operation.
-    catching = log::catchup(quorum, replica, network, proposal, *it);
-    catching.onAny(defer(self(), &Self::caughtup));
+    catching = log::catchup(quorum, replica, network, proposal, *it)
+      .onDiscarded(defer(self(), &Self::discarded))
+      .onFailed(defer(self(), &Self::failed))
+      .onReady(defer(self(), &Self::succeeded));
+
+    Timer::create(timeout, lambda::bind(&Self::timedout, catching));
   }
 
-  void caughtup()
+  void discarded()
   {
-    // No one can discard the future 'catching' except the 'finalize'.
-    CHECK(!catching.isDiscarded());
+    LOG(INFO) << "Unable to catch-up position " << *it
+              << " in " << timeout << ", retrying";
 
-    if (catching.isFailed()) {
-      promise.fail(
-          "Failed to catch-up position " + stringify(*it) +
-          ": " + catching.failure());
-      terminate(self());
-      return;
-    }
+    catchup();
+  }
 
+  void failed()
+  {
+    promise.fail(
+        "Failed to catch-up position " + stringify(*it) +
+        ": " + catching.failure());
+
+    terminate(self());
+  }
+
+  void succeeded()
+  {
     ++it;
 
     // The single position catch-up function: 'log::catchup' will
@@ -247,6 +265,7 @@ private:
   const Shared<Replica> replica;
   const Shared<Network> network;
   const set<uint64_t> positions;
+  const Duration timeout;
 
   uint64_t proposal;
   set<uint64_t>::iterator it;
@@ -265,16 +284,18 @@ Future<Nothing> catchup(
     size_t quorum,
     const Shared<Replica>& replica,
     const Shared<Network>& network,
-    uint64_t proposal,
-    const set<uint64_t>& positions)
+    const Option<uint64_t>& proposal,
+    const set<uint64_t>& positions,
+    const Duration& timeout)
 {
   BulkCatchUpProcess* process =
     new BulkCatchUpProcess(
         quorum,
         replica,
         network,
-        proposal,
-        positions);
+        proposal.get(0),
+        positions,
+        timeout);
 
   Future<Nothing> future = process->future();
   spawn(process, true);

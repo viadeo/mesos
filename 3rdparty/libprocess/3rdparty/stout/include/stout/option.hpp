@@ -18,7 +18,8 @@
 
 #include <algorithm>
 
-#include <stout/result.hpp>
+#include <stout/none.hpp>
+#include <stout/some.hpp>
 
 template <typename T>
 class Option
@@ -38,6 +39,14 @@ public:
 
   Option(const T& _t) : state(SOME), t(new T(_t)) {}
 
+  template <typename U>
+  Option(const U& u) : state(SOME), t(new T(u)) {}
+
+  Option(const None& none) : state(NONE), t(NULL) {}
+
+  template <typename U>
+  Option(const _Some<U>& some) : state(SOME), t(new T(some.t)) {}
+
   Option(const Option<T>& that)
   {
     state = that.state;
@@ -51,15 +60,6 @@ public:
   ~Option()
   {
     delete t;
-  }
-
-  operator Result<T> () const
-  {
-    if (isNone()) {
-      return Result<T>::none();
-    }
-
-    return Result<T>::some(get());
   }
 
   Option<T>& operator = (const Option<T>& that)
