@@ -39,7 +39,7 @@ start() {
 }
 
 stop() {
-  start-stop-daemon --stop --quiet --oknodo --pidfile "$PID"
+  start-stop-daemon --stop --oknodo --quiet --oknodo --pidfile "$PID"
   rm "$PID"
   exit 0
 }
