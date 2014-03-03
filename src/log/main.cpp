@@ -27,8 +27,10 @@
 #include <stout/hashmap.hpp>
 
 #include "log/tool.hpp"
+#include "log/tool/benchmark.hpp"
 #include "log/tool/initialize.hpp"
 #include "log/tool/read.hpp"
+#include "log/tool/replica.hpp"
 
 using namespace mesos;
 using namespace mesos::internal;
@@ -67,8 +69,10 @@ static void usage(const char* argv0)
 int main(int argc, char** argv)
 {
   // Register log tools.
+  add(Owned<tool::Tool>(new tool::Benchmark()));
   add(Owned<tool::Tool>(new tool::Initialize()));
   add(Owned<tool::Tool>(new tool::Read()));
+  add(Owned<tool::Tool>(new tool::Replica()));
 
   if (argc < 2) {
     usage(argv[0]);

@@ -18,6 +18,10 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/wait.h>
+
+#include <string.h>
+
 #include <list>
 #include <string>
 
@@ -98,27 +102,22 @@ static bool enable(const ::testing::TestInfo& test)
         return false;
       }
     }
+
+    // On Linux non-privileged users are limited to 64k of locked memory so we
+    // cannot run the MemIsolatorTest.Usage.
+    if (strings::contains(name, "MemIsolatorTest") && os::user() != "root") {
+      return false;
+    }
 #endif
   }
 
   // Now check the type parameter.
   if (test.type_param() != NULL) {
     const string& type = test.type_param();
-    if (strings::contains(type, "CgroupsIsolator") &&
+    if (strings::contains(type, "Cgroups") &&
         (os::user() != "root" || !os::exists("/proc/cgroups"))) {
       return false;
     }
-#ifdef __APPLE__
-    if (strings::contains(test.test_case_name(), "IsolatorTest") &&
-        strings::contains(test.name(), "Usage") &&
-        strings::contains(type, "ProcessIsolator") &&
-        os::user() != "root") {
-      // We can't run the Isolator resource usage test when we're not
-      // the root user on OSX because proc_pidinfo() only returns
-      // memory and CPU usage reliably when running as root.
-      return false;
-    }
-#endif
   }
 
   return true;
@@ -235,6 +234,14 @@ void Environment::TearDown()
     }
   }
   directories.clear();
+
+  // Make sure we haven't left any child processes lying around.
+  Try<os::ProcessTree> pstree = os::pstree(0);
+
+  if (pstree.isSome() && !pstree.get().children.empty()) {
+    FAIL() << "Tests completed with child processes remaining:\n"
+           << pstree.get();
+  }
 }
 
 

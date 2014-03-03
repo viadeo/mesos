@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fts.h>
 #include <signal.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #include <sys/syscall.h>
@@ -404,6 +405,121 @@ static Try<Nothing> write(
 
 } // namespace internal {
 
+
+Try<string> prepare(
+    const std::string& baseHierarchy,
+    const std::string& subsystem,
+    const std::string& cgroup)
+{
+  // Construct the hierarchy for this subsystem.
+  std::string hierarchy = path::join(baseHierarchy, subsystem);
+
+  // Ensure cgroups are enabled in the kernel.
+  if (!cgroups::enabled()) {
+    return Error("No cgroups support detected in this kernel");
+  }
+
+  // Ensure we have root permissions.
+  if (geteuid() != 0) {
+    return Error("Using cgroups requires root permissions");
+  }
+
+  // Check if the hierarchy is already mounted, and if not, mount it.
+  Try<bool> mounted = cgroups::mounted(hierarchy);
+
+  if (mounted.isError()) {
+    return Error("Failed to determine if " + hierarchy +
+                 " is already mounted: " + mounted.error());
+  }
+
+  if (mounted.get()) {
+    // Make sure that desired subsystem is attached to the already
+    // mounted hierarchy.
+    Try<std::set<std::string> > attached = cgroups::subsystems(hierarchy);
+    if (attached.isError()) {
+      return Error(string("Failed to determine the attached subsystems") +
+                   "for the cgroup hierarchy at " + hierarchy + ": " +
+                   attached.error());
+    }
+
+    if (attached.get().count(subsystem) == 0) {
+      return Error("The cgroups hierarchy at " + hierarchy +
+                   " can not be used because it does not have the '" +
+                   subsystem + "' subsystem attached");
+    }
+
+    if (attached.get().size() > 1) {
+      return Error("The " + subsystem + " subsystem is co-mounted at " +
+                   hierarchy + " with other subsytems");
+    }
+  } else {
+    // Attempt to mount the hierarchy ourselves.
+    if (os::exists(hierarchy)) {
+      // The path specified by the given hierarchy already exists in
+      // the file system. We try to remove it if it is an empty
+      // directory. This will helps us better deal with slave restarts
+      // since we won't need to manually remove the directory.
+      Try<Nothing> rmdir = os::rmdir(hierarchy, false);
+      if (rmdir.isError()) {
+        return Error("Failed to mount cgroups hierarchy at '" + hierarchy +
+                     "' because we could not remove the existing directory: " +
+                     rmdir.error());
+      }
+    }
+
+    // Mount the subsystem.
+    Try<Nothing> mount = cgroups::mount(hierarchy, subsystem);
+    if (mount.isError()) {
+      return Error("Failed to mount cgroups hierarchy at '" + hierarchy +
+                   "': " + mount.error());
+    }
+  }
+
+  // Create the cgroup if it doesn't exist.
+  Try<bool> exists = cgroups::exists(hierarchy, cgroup);
+  if (exists.isError()) {
+    return Error("Failed to check existence of root cgroup " +
+                 path::join(hierarchy, cgroup) +
+                 ": " + exists.error());
+  }
+
+  if (!exists.get()) {
+    // No cgroup exists, create it.
+    Try<Nothing> create = cgroups::create(hierarchy, cgroup);
+    if (create.isError()) {
+      return Error("Failed to create root cgroup " +
+                   path::join(hierarchy, cgroup) +
+                   ": " + create.error());
+    }
+  }
+
+  const string& testCgroup = path::join(cgroup, "test");
+  // Create a nested test cgroup if it doesn't exist.
+  exists = cgroups::exists(hierarchy, testCgroup);
+  if (exists.isError()) {
+    return Error("Failed to check existence nested of test cgroup " +
+                 path::join(hierarchy, testCgroup) +
+                 ": " + exists.error());
+  }
+
+  if (!exists.get()) {
+    // Make sure this kernel supports creating nested cgroups.
+    Try<Nothing> create = cgroups::create(hierarchy, testCgroup);
+    if (create.isError()) {
+      return Error(string("Failed to create a nested 'test' cgroup.") +
+                   " Your kernel might be too old to use the" +
+                   " cgroups isolator: " + create.error());
+    }
+  }
+
+  // Remove the nested 'test' cgroup.
+  Try<Nothing> remove = cgroups::remove(hierarchy, testCgroup);
+  if (remove.isError()) {
+    return Error("Failed to remove the nested test cgroup: " + remove.error());
+  }
+
+  return hierarchy;
+}
 
 // Returns some error string if either (a) hierarchy is not mounted,
 // (b) cgroup does not exist, or (c) control file does not exist.
@@ -1066,7 +1182,7 @@ protected:
     // Stop the listener if no one cares. Note that here we explicitly specify
     // the type of the terminate function because it is an overloaded function.
     // The compiler complains if we do not do it.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
         static_cast<void (*)(const UPID&, bool)>(terminate), self(), true));
 
     // Register an eventfd "notifier" for the given control.
@@ -1100,6 +1216,10 @@ protected:
         LOG(ERROR) << "Failed to unregistering eventfd: " << unregister.error();
       }
     }
+
+    // TODO(benh): Discard our promise only after 'reading' has
+    // completed (ready, failed, or discarded).
+    promise.discard();
   }
 
 private:
@@ -1107,24 +1227,14 @@ private:
   // result, either because the event has happened, or an error has occurred.
   void notified(const Future<size_t>&)
   {
-    // Ignore this function if the promise is no longer pending.
-    if (!promise.future().isPending()) {
-      return;
-    }
-
-    // Since the future reading can only be discarded when the promise is no
-    // longer pending, we shall never see a discarded reading here because of
-    // the check in the beginning of the function.
-    CHECK(!reading.isDiscarded());
-
-    if (reading.isFailed()) {
+    if (reading.isDiscarded()) {
+      promise.discard();
+    } else if (reading.isFailed()) {
       promise.fail("Failed to read eventfd: " + reading.failure());
+    } else if (reading.get() == sizeof(data)) {
+      promise.set(data);
     } else {
-      if (reading.get() == sizeof(data)) {
-        promise.set(data);
-      } else {
-        promise.fail("Read less than expected");
-      }
+      promise.fail("Read less than expected");
     }
 
     terminate(self());
@@ -1189,7 +1299,7 @@ protected:
   virtual void initialize()
   {
     // Stop the process if no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
         static_cast<void (*)(const UPID&, bool)>(terminate), self(), true));
 
     CHECK(interval >= Seconds(0));
@@ -1201,6 +1311,11 @@ protected:
     } else if (action == "THAW") {
       thaw();
     }
+  }
+
+  virtual void finalize()
+  {
+    promise.discard();
   }
 
 private:
@@ -1447,12 +1562,17 @@ protected:
   virtual void initialize()
   {
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
         static_cast<void (*)(const UPID&, bool)>(terminate), self(), true));
 
     CHECK(interval >= Seconds(0));
 
     check();
+  }
+
+  virtual void finalize()
+  {
+    promise.discard();
   }
 
 private:
@@ -1509,7 +1629,7 @@ protected:
   virtual void initialize()
   {
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
           static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
 
     CHECK(interval >= Seconds(0));
@@ -1520,8 +1640,12 @@ protected:
   virtual void finalize()
   {
     // Cancel the chain of operations if the user discards the future.
-    if (promise.future().isDiscarded()) {
+    if (promise.future().hasDiscard()) {
       chain.discard();
+
+      // TODO(benh): Discard our promise only after 'chain' has
+      // completed (ready, failed, or discarded).
+      promise.discard();
     }
   }
 
@@ -1574,8 +1698,10 @@ private:
 
   void finished(const Future<bool>& empty)
   {
-    CHECK(!empty.isPending() && !empty.isDiscarded());
-    if (empty.isFailed()) {
+    if (empty.isDiscarded()) {
+      promise.discard();
+      terminate(self());
+    } else if (empty.isFailed()) {
       promise.fail(empty.failure());
       terminate(self());
     } else if (empty.get()) {
@@ -1616,7 +1742,7 @@ protected:
   virtual void initialize()
   {
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
           static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
 
     CHECK(interval >= Seconds(0));
@@ -1637,17 +1763,23 @@ protected:
   virtual void finalize()
   {
     // Cancel the operation if the user discards the future.
-    if (promise.future().isDiscarded()) {
+    if (promise.future().hasDiscard()) {
       discard<bool>(killers);
+
+      // TODO(benh): Discard our promise only after all 'killers' have
+      // completed (ready, failed, or discarded).
+      promise.discard();
     }
   }
 
 private:
   void killed(const Future<list<bool> >& kill)
   {
-    CHECK(!kill.isPending() && !kill.isDiscarded());
     if (kill.isReady()) {
       remove();
+    } else if (kill.isDiscarded()) {
+      promise.discard();
+      terminate(self());
     } else if (kill.isFailed()) {
       promise.fail("Failed to kill tasks in nested cgroups: " + kill.failure());
       terminate(self());

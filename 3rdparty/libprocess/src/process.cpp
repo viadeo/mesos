@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,7 @@
 #include <process/profiler.hpp>
 #include <process/socket.hpp>
 #include <process/statistics.hpp>
+#include <process/system.hpp>
 #include <process/time.hpp>
 #include <process/timer.hpp>
 
@@ -135,12 +137,12 @@ namespace ID {
 
 string generate(const string& prefix)
 {
-  static map<string, int> prefixes;
+  static map<string, int>* prefixes = new map<string, int>();
   static synchronizable(prefixes) = SYNCHRONIZED_INITIALIZER;
 
   int id;
   synchronized (prefixes) {
-    int& _id = prefixes[prefix];
+    int& _id = (*prefixes)[prefix];
     _id += 1;
     id = _id;
   }
@@ -148,13 +150,6 @@ string generate(const string& prefix)
 }
 
 } // namespace ID {
-
-
-namespace http {
-
-hashmap<uint16_t, string> statuses;
-
-} // namespace http {
 
 
 namespace mime {
@@ -290,6 +285,15 @@ private:
     ~Item()
     {
       delete future;
+    }
+
+    // Helper for cleaning up a response (i.e., closing any open pipes
+    // in the event Response::type is PIPE).
+    static void cleanup(const Response& response)
+    {
+      if (response.type == Response::PIPE) {
+        os::close(response.pipe);
+      }
     }
 
     const Request request; // Make a copy.
@@ -558,8 +562,7 @@ static synchronizable(watchers) = SYNCHRONIZED_INITIALIZER;
 // We store the timers in a map of lists indexed by the timeout of the
 // timer so that we can have two timers that have the same timeout. We
 // exploit that the map is SORTED!
-static map<Time, list<Timer> >* timeouts =
-  new map<Time, list<Timer> >();
+static map<Time, list<Timer> >* timeouts = new map<Time, list<Timer> >();
 static synchronizable(timeouts) = SYNCHRONIZED_INITIALIZER_RECURSIVE;
 
 // For supporting Clock::settle(), true if timers have been removed
@@ -602,18 +605,16 @@ namespace clock {
 
 map<ProcessBase*, Time>* currents = new map<ProcessBase*, Time>();
 
-Time initial = Time::EPOCH;
-Time current = Time::EPOCH;
+// TODO(dhamon): These static non-POD instances should be replaced by pointers
+// or functions.
+Time initial = Time::epoch();
+Time current = Time::epoch();
+
+Duration advanced = Duration::zero();
 
 bool paused = false;
 
 } // namespace clock {
-
-
-Time Time::EPOCH = Time(Duration::zero());
-
-
-Time Time::MAX = Time(Duration::max());
 
 
 Time Clock::now()
@@ -640,7 +641,7 @@ Time Clock::now(ProcessBase* process)
 
   // TODO(benh): Versus ev_now()?
   double d = ev_time();
-  Try<Time> time = Time::create(d);
+  Try<Time> time = Time::create(d); // Compensates for clock::advanced.
 
   // TODO(xujyan): Move CHECK_SOME to libprocess and add CHECK_SOME
   // here.
@@ -696,6 +697,7 @@ void Clock::advance(const Duration& duration)
 {
   synchronized (timeouts) {
     if (clock::paused) {
+      clock::advanced += duration;
       clock::current += duration;
       VLOG(2) << "Clock advanced ("  << duration << ") to " << clock::current;
       if (!update_timer) {
@@ -726,6 +728,7 @@ void Clock::update(const Time& time)
   synchronized (timeouts) {
     if (clock::paused) {
       if (clock::current < time) {
+        clock::advanced += (time - clock::current);
         clock::current = Time(time);
         VLOG(2) << "Clock updated to " << clock::current;
         if (!update_timer) {
@@ -761,6 +764,18 @@ void Clock::settle()
 {
   CHECK(clock::paused); // TODO(benh): Consider returning a bool instead.
   process_manager->settle();
+}
+
+
+Try<Time> Time::create(double seconds)
+{
+  Try<Duration> duration = Duration::create(seconds);
+  if (duration.isSome()) {
+    // In production code, clock::advanced will always be zero!
+    return Time(duration.get() + clock::advanced);
+  } else {
+    return Error("Argument too large for Time: " + duration.error());
+  }
 }
 
 
@@ -1410,7 +1425,7 @@ void initialize(const string& delegate)
   }
 
   // Create a "server" socket for communicating with other nodes.
-  if ((__s__ = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+  if ((__s__ = ::socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     PLOG(FATAL) << "Failed to initialize, socket";
   }
 
@@ -1535,6 +1550,9 @@ void initialize(const string& delegate)
   // Create the global profiler process.
   spawn(new Profiler(), true);
 
+  // Create the global system statistics process.
+  spawn(new System(), true);
+
   // Create the global statistics.
   value = getenv("LIBPROCESS_STATISTICS_WINDOW");
   if (value != NULL) {
@@ -1607,13 +1625,10 @@ HttpProxy::~HttpProxy()
     // Attempt to discard the future.
     item->future->discard();
 
-    // But it might have already been ready ...
-    if (item->future->isReady()) {
-      const Response& response = item->future->get();
-      if (response.type == Response::PIPE) {
-        os::close(response.pipe);
-      }
-    }
+    // But it might have already been ready. In general, we need to
+    // wait until this future is potentially ready in order to attempt
+    // to close a pipe if one exists.
+    item->future->onReady(lambda::bind(&Item::cleanup, lambda::_1));
 
     items.pop();
     delete item;
@@ -1871,12 +1886,13 @@ void SocketManager::link(ProcessBase* process, const UPID& to)
     // Check if node is remote and there isn't a persistant link.
     if ((node.ip != __ip__ || node.port != __port__)
         && persists.count(node) == 0) {
-      // Okay, no link, lets create a socket.
-      int s;
-
-      if ((s = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        PLOG(FATAL) << "Failed to link, socket";
+      // Okay, no link, let's create a socket.
+      Try<int> socket = process::socket(AF_INET, SOCK_STREAM, 0);
+      if (socket.isError()) {
+        LOG(FATAL) << "Failed to link, socket: " << socket.error();
       }
+
+      int s = socket.get();
 
       Try<Nothing> nonblock = os::nonblock(s);
       if (nonblock.isError()) {
@@ -2037,13 +2053,14 @@ void SocketManager::send(Message* message)
       CHECK(sockets.count(s) > 0);
       send(new MessageEncoder(sockets[s], message), persist);
     } else {
-      // No peristant or temporary socket to the node currently
+      // No peristent or temporary socket to the node currently
       // exists, so we create a temporary one.
-      int s;
-
-      if ((s = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        PLOG(FATAL) << "Failed to send, socket";
+      Try<int> socket = process::socket(AF_INET, SOCK_STREAM, 0);
+      if (socket.isError()) {
+        LOG(FATAL) << "Failed to send, socket: " << socket.error();
       }
+
+      int s = socket.get();
 
       Try<Nothing> nonblock = os::nonblock(s);
       if (nonblock.isError()) {
@@ -2922,7 +2939,7 @@ Future<Response> ProcessManager::__processes__(const Request&)
   JSON::Array array;
 
   synchronized (processes) {
-    foreachvalue (const ProcessBase* process, process_manager->processes) {
+    foreachvalue (ProcessBase* process, process_manager->processes) {
       JSON::Object object;
       object.values["id"] = process->pid.id;
 
@@ -2984,9 +3001,13 @@ Future<Response> ProcessManager::__processes__(const Request&)
         JSON::Array* events;
       } visitor(&events);
 
-      foreach (Event* event, process->events) {
-        event->visit(&visitor);
+      process->lock();
+      {
+        foreach (Event* event, process->events) {
+          event->visit(&visitor);
+        }
       }
+      process->unlock();
 
       object.values["events"] = events;
       array.values.push_back(object);
@@ -3419,36 +3440,143 @@ namespace io {
 
 namespace internal {
 
-void read(int fd,
-          void* data,
-          size_t size,
-          const memory::shared_ptr<Promise<size_t> >& promise,
-          const Future<short>& future)
+void read(
+    int fd,
+    void* data,
+    size_t size,
+    const memory::shared_ptr<Promise<size_t> >& promise,
+    const Future<short>& future)
 {
-  // Ignore this function if the read operation has been cancelled.
-  if (promise->future().isDiscarded()) {
+  // Ignore this function if the read operation has been discarded.
+  if (promise->future().hasDiscard()) {
+    promise->discard();
     return;
   }
 
-  // Since promise->future() will be discarded before future is
-  // discarded, we should never see a discarded future here because of
-  // the check in the beginning of this function.
-  CHECK(!future.isDiscarded());
+  if (size == 0) {
+    promise->set(0);
+    return;
+  }
 
-  if (future.isFailed()) {
+  if (future.isDiscarded()) {
+    promise->fail("Failed to poll: discarded future");
+  } else if (future.isFailed()) {
     promise->fail(future.failure());
   } else {
     ssize_t length = ::read(fd, data, size);
     if (length < 0) {
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
         // Restart the read operation.
-        poll(fd, process::io::READ).onAny(
-            lambda::bind(&internal::read, fd, data, size, promise, lambda::_1));
+        Future<short> future =
+          poll(fd, process::io::READ).onAny(
+              lambda::bind(&internal::read,
+                           fd,
+                           data,
+                           size,
+                           promise,
+                           lambda::_1));
+
+        // Stop polling if a discard occurs on our future.
+        promise->future().onDiscard(
+            lambda::bind(&process::internal::discard<short>,
+                         WeakFuture<short>(future)));
       } else {
         // Error occurred.
         promise->fail(strerror(errno));
       }
     } else {
+      promise->set(length);
+    }
+  }
+}
+
+
+void write(
+    int fd,
+    void* data,
+    size_t size,
+    const memory::shared_ptr<Promise<size_t> >& promise,
+    const Future<short>& future)
+{
+  // Ignore this function if the write operation has been discarded.
+  if (promise->future().hasDiscard()) {
+    promise->discard();
+    return;
+  }
+
+  if (size == 0) {
+    promise->set(0);
+    return;
+  }
+
+  if (future.isDiscarded()) {
+    promise->fail("Failed to poll: discarded future");
+  } else if (future.isFailed()) {
+    promise->fail(future.failure());
+  } else {
+    // Do a write but ignore SIGPIPE so we can return an error when
+    // writing to a pipe or socket where the reading end is closed.
+    // TODO(benh): The 'suppress' macro failed to work on OS X as it
+    // appears that signal delivery was happening asynchronously.
+    // That is, the signal would not appear to be pending when the
+    // 'suppress' block was closed thus the destructor for
+    // 'Suppressor' was not waiting/removing the signal via 'sigwait'.
+    // It also appeared that the signal would be delivered to another
+    // thread even if it remained blocked in this thiread. The
+    // workaround here is to check explicitly for EPIPE and then do
+    // 'sigwait' regardless of what 'os::signals::pending' returns. We
+    // don't have that luxury with 'Suppressor' and arbitrary signals
+    // because we don't always have something like EPIPE to tell us
+    // that a signal is (or will soon be) pending.
+    bool pending = os::signals::pending(SIGPIPE);
+    bool unblock = !pending ? os::signals::block(SIGPIPE) : false;
+
+    ssize_t length = ::write(fd, data, size);
+
+    // Save the errno so we can restore it after doing sig* functions
+    // below.
+    int errno_ = errno;
+
+    if (length < 0 && errno == EPIPE && !pending) {
+      sigset_t mask;
+      sigemptyset(&mask);
+      sigaddset(&mask, SIGPIPE);
+
+      int result;
+      do {
+        int ignored;
+        result = sigwait(&mask, &ignored);
+      } while (result == -1 && errno == EINTR);
+    }
+
+    if (unblock) {
+      os::signals::unblock(SIGPIPE);
+    }
+
+    errno = errno_;
+
+    if (length < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Restart the write operation.
+        Future<short> future =
+          poll(fd, process::io::WRITE).onAny(
+              lambda::bind(&internal::write,
+                           fd,
+                           data,
+                           size,
+                           promise,
+                           lambda::_1));
+
+        // Stop polling if a discard occurs on our future.
+        promise->future().onDiscard(
+            lambda::bind(&process::internal::discard<short>,
+                         WeakFuture<short>(future)));
+      } else {
+        // Error occurred.
+        promise->fail(strerror(errno));
+      }
+    } else {
+      // TODO(benh): Retry if 'length' is 0?
       promise->set(length);
     }
   }
@@ -3467,6 +3595,18 @@ Future<short> poll(int fd, short events)
 
   // Get a copy of the future to avoid any races with the event loop.
   Future<short> future = promise->future();
+
+  // Make sure we stop polling if a discard occurs on our future.
+  // TODO(benh): This is actually insuffient in as much as we need to
+  // interrupt the libev event loop and stop and remove the
+  // watcher. This has been left as a TODO since (a) it's a
+  // non-trivial change (i.e., updating 'handle_async' to also remove
+  // watchers) and (b) it's most likely that the file descriptor being
+  // polled will be closed after the promise is discarded which will
+  // invoke 'polled' which will then cause the watcher to be stopped
+  // and deleted. Note that we needed to make Promise<T>::discard a
+  // 'friend' which should be removed once we clean this up.
+  future.onDiscard(lambda::bind(&process::internal::discarded<short>, future));
 
   ev_io* watcher = new ev_io();
   watcher->data = promise;
@@ -3494,39 +3634,71 @@ Future<size_t> read(int fd, void* data, size_t size)
   // Check the file descriptor.
   Try<bool> nonblock = os::isNonblock(fd);
   if (nonblock.isError()) {
-    // The file descriptor is not valid (e.g. fd has been closed).
-    promise->fail(string("Failed to check O_NONBLOCK") + strerror(errno));
+    // The file descriptor is not valid (e.g., has been closed).
+    promise->fail(
+        "Failed to check if file descriptor was non-blocking: " +
+        nonblock.error());
     return promise->future();
   } else if (!nonblock.get()) {
-    // The fd is not opened with O_NONBLOCK set.
-    promise->fail("Please use a fd opened with O_NONBLOCK set");
-    return promise->future();
-  }
-
-  if (size == 0) {
-    promise->fail("Try to read nothing");
+    // The file descriptor is not non-blocking.
+    promise->fail("Expected a non-blocking file descriptor");
     return promise->future();
   }
 
   // Because the file descriptor is non-blocking, we call read()
-  // immediately. The read may in turn call poll if needed, avoiding
-  // unnecessary polling. We also observed that for some combination
-  // of libev and Linux kernel versions, the poll would block for
-  // non-deterministically long periods of time. This may be fixed in
-  // a newer version of libev (we use 3.8 at the time of writing this
-  // comment).
+  // immediately. The read may in turn call poll if necessary,
+  // avoiding unnecessary polling. We also observed that for some
+  // combination of libev and Linux kernel versions, the poll would
+  // block for non-deterministically long periods of time. This may be
+  // fixed in a newer version of libev (we use 3.8 at the time of
+  // writing this comment).
   internal::read(fd, data, size, promise, io::READ);
 
   return promise->future();
 }
 
+
+Future<size_t> write(int fd, void* data, size_t size)
+{
+  process::initialize();
+
+  memory::shared_ptr<Promise<size_t> > promise(new Promise<size_t>());
+
+  // Check the file descriptor.
+  Try<bool> nonblock = os::isNonblock(fd);
+  if (nonblock.isError()) {
+    // The file descriptor is not valid (e.g., has been closed).
+    promise->fail(
+        "Failed to check if file descriptor was non-blocking: " +
+        nonblock.error());
+    return promise->future();
+  } else if (!nonblock.get()) {
+    // The file descriptor is not non-blocking.
+    promise->fail("Expected a non-blocking file descriptor");
+    return promise->future();
+  }
+
+  // Because the file descriptor is non-blocking, we call write()
+  // immediately. The write may in turn call poll if necessary,
+  // avoiding unnecessary polling. We also observed that for some
+  // combination of libev and Linux kernel versions, the poll would
+  // block for non-deterministically long periods of time. This may be
+  // fixed in a newer version of libev (we use 3.8 at the time of
+  // writing this comment).
+  internal::write(fd, data, size, promise, io::WRITE);
+
+  return promise->future();
+}
+
+
 namespace internal {
 
 #if __cplusplus >= 201103L
-Future<string> _read(int fd,
-                     const memory::shared_ptr<string>& buffer,
-                     const boost::shared_array<char>& data,
-                     size_t length)
+Future<string> _read(
+    int fd,
+    const memory::shared_ptr<string>& buffer,
+    const boost::shared_array<char>& data,
+    size_t length)
 {
   return io::read(fd, data.get(), length)
     .then([=] (size_t size) -> Future<string> {
@@ -3539,15 +3711,15 @@ Future<string> _read(int fd,
 }
 #else
 // Forward declataion.
-Future<string> _read(int fd,
-                     const memory::shared_ptr<string>& buffer,
-                     const boost::shared_array<char>& data,
-                     size_t length);
+Future<string> _read(
+    int fd,
+    const memory::shared_ptr<string>& buffer,
+    const boost::shared_array<char>& data,
+    size_t length);
 
 
 Future<string> __read(
-    const size_t& size,
-    // TODO(benh): Remove 'const &' after fixing libprocess.
+    size_t size,
     int fd,
     const memory::shared_ptr<string>& buffer,
     const boost::shared_array<char>& data,
@@ -3563,13 +3735,194 @@ Future<string> __read(
 }
 
 
-Future<string> _read(int fd,
-                     const memory::shared_ptr<string>& buffer,
-                     const boost::shared_array<char>& data,
-                     size_t length)
+Future<string> _read(
+    int fd,
+    const memory::shared_ptr<string>& buffer,
+    const boost::shared_array<char>& data,
+    size_t length)
 {
   return io::read(fd, data.get(), length)
     .then(lambda::bind(&__read, lambda::_1, fd, buffer, data, length));
+}
+#endif // __cplusplus >= 201103L
+
+
+#if __cplusplus >= 201103L
+Future<Nothing> _write(
+    int fd,
+    Owned<string> data,
+    size_t index)
+{
+  return io::write(fd, (void*) (data->data() + index), data->size() - index)
+    .then([=] (size_t length) -> Future<Nothing> {
+      if (index + length == data->size()) {
+        return Nothing();
+      }
+      return _write(fd, data, index + length);
+    });
+}
+#else
+// Forward declaration.
+Future<Nothing> _write(
+    int fd,
+    Owned<string> data,
+    size_t index);
+
+
+Future<Nothing> __write(
+    int fd,
+    Owned<string> data,
+    size_t index,
+    size_t length)
+{
+  if (index + length == data->size()) {
+    return Nothing();
+  }
+  return _write(fd, data, index + length);
+}
+
+
+Future<Nothing> _write(
+    int fd,
+    Owned<string> data,
+    size_t index)
+{
+  return io::write(fd, (void*) (data->data() + index), data->size() - index)
+    .then(lambda::bind(&__write, fd, data, index, lambda::_1));
+}
+#endif // __cplusplus >= 201103L
+
+
+#if __cplusplus >= 201103L
+void _splice(
+    int from,
+    int to,
+    size_t chunk,
+    boost::shared_array<char> data,
+    memory::shared_ptr<Promise<Nothing>> promise)
+{
+  // Stop splicing if a discard occured on our future.
+  if (promise->future().hasDiscard()) {
+    // TODO(benh): Consider returning the number of bytes already
+    // spliced on discarded, or a failure. Same for the 'onDiscarded'
+    // callbacks below.
+    promise->discard();
+    return;
+  }
+
+  // Note that only one of io::read or io::write is outstanding at any
+  // one point in time thus the reuse of 'data' for both operations.
+
+  Future<size_t> read = io::read(from, data.get(), chunk);
+
+  // Stop reading (or potentially indefinitely polling) if a discard
+  // occcurs on our future.
+  promise->future().onDiscard(
+      lambda::bind(&process::internal::discard<size_t>,
+                   WeakFuture<size_t>(read)));
+
+  read
+    .onReady([=] (size_t size) {
+      if (size == 0) { // EOF.
+        promise->set(Nothing());
+      } else {
+        // Note that we always try and complete the write, even if a
+        // discard has occured on our future, in order to provide
+        // semantics where everything read is written. The promise
+        // will eventually be discarded in the next read.
+        io::write(to, string(data.get(), size))
+          .onReady([=] () { _splice(from, to, chunk, data, promise); })
+          .onFailed([=] (const string& message) { promise->fail(message); })
+          .onDiscarded([=] () { promise->discard(); });
+      }
+    })
+    .onFailed([=] (const string& message) { promise->fail(message); })
+    .onDiscarded([=] () { promise->discard(); });
+}
+#else
+// Forward declarations.
+void __splice(
+    int from,
+    int to,
+    size_t chunk,
+    boost::shared_array<char> data,
+    memory::shared_ptr<Promise<Nothing> > promise,
+    size_t size);
+
+void ___splice(
+    memory::shared_ptr<Promise<Nothing> > promise,
+    const string& message);
+
+void ____splice(
+    memory::shared_ptr<Promise<Nothing> > promise);
+
+
+void _splice(
+    int from,
+    int to,
+    size_t chunk,
+    boost::shared_array<char> data,
+    memory::shared_ptr<Promise<Nothing> > promise)
+{
+  // Stop splicing if a discard occured on our future.
+  if (promise->future().hasDiscard()) {
+    // TODO(benh): Consider returning the number of bytes already
+    // spliced on discarded, or a failure. Same for the 'onDiscarded'
+    // callbacks below.
+    promise->discard();
+    return;
+  }
+
+  Future<size_t> read = io::read(from, data.get(), chunk);
+
+  // Stop reading (or potentially indefinitely polling) if a discard
+  // occurs on our future.
+  promise->future().onDiscard(
+      lambda::bind(&process::internal::discard<size_t>,
+                   WeakFuture<size_t>(read)));
+
+  read
+    .onReady(lambda::bind(&__splice, from, to, chunk, data, promise, lambda::_1))
+    .onFailed(lambda::bind(&___splice, promise, lambda::_1))
+    .onDiscarded(lambda::bind(&____splice, promise));
+}
+
+
+void __splice(
+    int from,
+    int to,
+    size_t chunk,
+    boost::shared_array<char> data,
+    memory::shared_ptr<Promise<Nothing> > promise,
+    size_t size)
+{
+  if (size == 0) { // EOF.
+    promise->set(Nothing());
+  } else {
+    // Note that we always try and complete the write, even if a
+    // discard has occured on our future, in order to provide
+    // semantics where everything read is written. The promise will
+    // eventually be discarded in the next read.
+    io::write(to, string(data.get(), size))
+      .onReady(lambda::bind(&_splice, from, to, chunk, data, promise))
+      .onFailed(lambda::bind(&___splice, promise, lambda::_1))
+      .onDiscarded(lambda::bind(&____splice, promise));
+  }
+}
+
+
+void ___splice(
+    memory::shared_ptr<Promise<Nothing> > promise,
+    const string& message)
+{
+  promise->fail(message);
+}
+
+
+void ____splice(
+    memory::shared_ptr<Promise<Nothing> > promise)
+{
+  promise->discard();
 }
 #endif // __cplusplus >= 201103L
 
@@ -3589,157 +3942,32 @@ Future<string> read(int fd)
 }
 
 
+Future<Nothing> write(int fd, const std::string& data)
+{
+  process::initialize();
+
+  return internal::_write(fd, Owned<string>(new string(data)), 0);
+}
+
+
+Future<Nothing> splice(int from, int to, size_t chunk)
+{
+  boost::shared_array<char> data(new char[chunk]);
+
+  // Rather than having internal::_splice return a future and
+  // implementing internal::_splice as a chain of io::read and
+  // io::write calls, we use an explicit promise that we pass around
+  // so that we don't increase memory usage the longer that we splice.
+  memory::shared_ptr<Promise<Nothing> > promise(new Promise<Nothing>());
+
+  Future<Nothing> future = promise->future();
+
+  internal::_splice(from, to, chunk, data, promise);
+
+  return future;
+}
+
 } // namespace io {
-
-
-namespace http {
-
-namespace internal {
-
-Future<Response> decode(const string& buffer)
-{
-  ResponseDecoder decoder;
-  deque<Response*> responses = decoder.decode(buffer.c_str(), buffer.length());
-
-  if (decoder.failed() || responses.empty()) {
-    for (size_t i = 0; i < responses.size(); ++i) {
-      delete responses[i];
-    }
-    return Failure("Failed to decode HTTP response:\n" + buffer + "\n");
-  } else if (responses.size() > 1) {
-    PLOG(ERROR) << "Received more than 1 HTTP Response";
-  }
-
-  Response response = *responses[0];
-  for (size_t i = 0; i < responses.size(); ++i) {
-    delete responses[i];
-  }
-
-  return response;
-}
-
-
-Future<Response> request(
-    const UPID& upid,
-    const string& method,
-    const Option<string>& path,
-    const Option<string>& query,
-    const Option<string>& body,
-    const Option<string>& contentType)
-{
-  int s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-
-  if (s < 0) {
-    return Failure(string("Failed to create socket: ") + strerror(errno));
-  }
-
-  Try<Nothing> cloexec = os::cloexec(s);
-  if (!cloexec.isSome()) {
-    os::close(s);
-    return Failure("Failed to cloexec: " + cloexec.error());
-  }
-
-  sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(upid.port);
-  addr.sin_addr.s_addr = upid.ip;
-
-  if (connect(s, (sockaddr*) &addr, sizeof(addr)) < 0) {
-    os::close(s);
-    return Failure(string("Failed to connect: ") + strerror(errno));
-  }
-
-  std::ostringstream out;
-
-  out << method << " /" << upid.id;
-
-  if (path.isSome()) {
-    out << "/" << path.get();
-  }
-
-  if (query.isSome()) {
-    out << "?" << query.get();
-  }
-
-  out << " HTTP/1.1\r\n";
-
-  // Call inet_ntop since inet_ntoa is not thread-safe!
-  char ip[INET_ADDRSTRLEN];
-  PCHECK(inet_ntop(AF_INET, (in_addr *) &upid.ip, ip, INET_ADDRSTRLEN) != NULL);
-
-  out << "Host: " << ip << ":" << upid.port << "\r\n"
-      << "Connection: close\r\n";
-
-  if (body.isNone() && contentType.isSome()) {
-    os::close(s);
-    return Failure("Attempted to do a POST with a Content-Type but no body");
-  }
-
-  if (contentType.isSome()) {
-    out << "Content-Type: " << contentType.get() << "\r\n";
-  }
-
-  if (body.isNone()) {
-    out << "\r\n";
-  } else {
-    out << "Content-Length: " << body.get().length() << "\r\n"
-        << "\r\n"
-        << body.get();
-  }
-
-  // TODO(bmahler): Use benh's async write when it gets committed.
-  const string& data = out.str();
-  int remaining = data.size();
-
-  while (remaining > 0) {
-    int n = write(s, data.data() + (data.size() - remaining), remaining);
-
-    if (n < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      os::close(s);
-      return Failure(string("Failed to write: ") + strerror(errno));
-    }
-
-    remaining -= n;
-  }
-
-  Try<Nothing> nonblock = os::nonblock(s);
-  if (!nonblock.isSome()) {
-    os::close(s);
-    return Failure("Failed to set nonblock: " + nonblock.error());
-  }
-
-  // Decode once the async read completes.
-  return io::read(s)
-    .then(lambda::bind(&internal::decode, lambda::_1))
-    .onAny(lambda::bind(&os::close, s));
-}
-
-} // namespace internal {
-
-
-Future<Response> get(
-    const UPID& upid,
-    const Option<string>& path,
-    const Option<string>& query)
-{
-  return internal::request(upid, "GET", path, query, None(), None());
-}
-
-
-Future<Response> post(
-    const UPID& upid,
-    const Option<string>& path,
-    const Option<string>& body,
-    const Option<string>& contentType)
-{
-  return internal::request(upid, "POST", path, None(), body, contentType);
-}
-
-}  // namespace http {
 
 namespace internal {
 

@@ -22,8 +22,7 @@
 #include <string>
 #include <vector>
 
-#include <mesos/mesos.hpp>
-#include <mesos/resources.hpp>
+#include <boost/array.hpp>
 
 #include <process/help.hpp>
 
@@ -38,17 +37,19 @@
 
 #include "common/attributes.hpp"
 #include "common/build.hpp"
-#include "common/type_utils.hpp"
+#include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
+#include "common/type_utils.hpp"
 
 #include "logging/logging.hpp"
 
 #include "master/master.hpp"
 
-namespace mesos {
-namespace internal {
-namespace master {
+#include "mesos/mesos.hpp"
+#include "mesos/resources.hpp"
 
+using process::Clock;
+using process::DESCRIPTION;
 using process::Future;
 using process::HELP;
 using process::TLDR;
@@ -59,102 +60,26 @@ using process::http::InternalServerError;
 using process::http::NotFound;
 using process::http::OK;
 using process::http::TemporaryRedirect;
-using process::http::Response;
-using process::http::Request;
 
 using std::map;
 using std::string;
 using std::vector;
 
+
+namespace mesos {
+namespace internal {
+namespace master {
+
+// Pull in model overrides from common.
+using mesos::internal::model;
+
+// Pull in definitions from process.
+using process::http::Response;
+using process::http::Request;
+
+
 // TODO(bmahler): Kill these in favor of automatic Proto->JSON Conversion (when
 // it becomes available).
-
-// Returns a JSON object modeled on a Resources.
-JSON::Object model(const Resources& resources)
-{
-  JSON::Object object;
-
-  foreach (const Resource& resource, resources) {
-    switch (resource.type()) {
-      case Value::SCALAR:
-        object.values[resource.name()] = resource.scalar().value();
-        break;
-      case Value::RANGES:
-        object.values[resource.name()] = stringify(resource.ranges());
-        break;
-      case Value::SET:
-        object.values[resource.name()] = stringify(resource.set());
-        break;
-      default:
-        LOG(FATAL) << "Unexpected Value type: " << resource.type();
-        break;
-    }
-  }
-
-  return object;
-}
-
-
-JSON::Object model(const Attributes& attributes)
-{
-  JSON::Object object;
-
-  foreach (const Attribute& attribute, attributes) {
-    switch (attribute.type()) {
-      case Value::SCALAR:
-        object.values[attribute.name()] = attribute.scalar().value();
-        break;
-      case Value::RANGES:
-        object.values[attribute.name()] = stringify(attribute.ranges());
-        break;
-      case Value::SET:
-        object.values[attribute.name()] = stringify(attribute.set());
-        break;
-      case Value::TEXT:
-        object.values[attribute.name()] = attribute.text().value();
-        break;
-      default:
-        LOG(FATAL) << "Unexpected Value type: " << attribute.type();
-        break;
-    }
-  }
-
-  return object;
-}
-
-
-// Returns a JSON object modeled on a TaskStatus.
-JSON::Object model(const TaskStatus& status)
-{
-  JSON::Object object;
-  object.values["state"] = TaskState_Name(status.state());
-  object.values["timestamp"] = status.timestamp();
-
-  return object;
-}
-
-
-// Returns a JSON object modeled on a Task.
-// TODO(bmahler): Expose the executor name / source.
-JSON::Object model(const Task& task)
-{
-  JSON::Object object;
-  object.values["id"] = task.task_id().value();
-  object.values["name"] = task.name();
-  object.values["framework_id"] = task.framework_id().value();
-  object.values["executor_id"] = task.executor_id().value();
-  object.values["slave_id"] = task.slave_id().value();
-  object.values["state"] = TaskState_Name(task.state());
-  object.values["resources"] = model(task.resources());
-
-  JSON::Array array;
-  foreach (const TaskStatus& status, task.statuses()) {
-    array.values.push_back(model(status));
-  }
-  object.values["statuses"] = array;
-
-  return object;
-}
 
 
 // Returns a JSON object modeled on an Offer.
@@ -278,6 +203,103 @@ Future<Response> Master::Http::health(const Request& request)
   return OK();
 }
 
+const static string HOSTS_KEY = "hosts";
+const static string LEVEL_KEY = "level";
+const static string MONITOR_KEY = "monitor";
+
+const string Master::Http::OBSERVE_HELP = HELP(
+    TLDR(
+        "Observe a monitor health state for host(s)."),
+    USAGE(
+        "/master/observe"),
+    DESCRIPTION(
+        "This endpoint receives information indicating host(s) ",
+        "health."
+        "",
+        "The following fields should be supplied in a POST:",
+        "1. " + MONITOR_KEY + " - name of the monitor that is being reported",
+        "2. " + HOSTS_KEY + " - comma seperated list of hosts",
+        "3. " + LEVEL_KEY + " - OK for healthy, anything else for unhealthy"));
+
+
+Try<string> getFormValue(
+    const string& key,
+    const hashmap<string, string>& values)
+{
+  Option<string> value = values.get(key);
+
+  if (value.isNone()) {
+    return Error("Missing value for '" + key + "'.");
+  }
+
+  // HTTP decode the value.
+  Try<string> decodedValue = process::http::decode(value.get());
+  if (decodedValue.isError()) {
+    return decodedValue;
+  }
+
+  // Treat empty string as an error.
+  if (decodedValue.isSome() && decodedValue.get().empty()) {
+    return Error("Empty string for '" + key + "'.");
+  }
+
+  return decodedValue.get();
+}
+
+
+Future<Response> Master::Http::observe(const Request& request)
+{
+  LOG(INFO) << "HTTP request for '" << request.path << "'";
+
+  hashmap<string, string> values =
+    process::http::query::parse(request.body);
+
+  // Build up a JSON object of the values we recieved and send them back
+  // down the wire as JSON for validation / confirmation.
+  JSON::Object response;
+
+  // TODO(ccarson):  As soon as RepairCoordinator is introduced it will
+  // consume these values. We should revisit if we still want to send the
+  // JSON down the wire at that point.
+
+  // Add 'monitor'.
+  Try<string> monitor = getFormValue(MONITOR_KEY, values);
+  if (monitor.isError()) {
+    return BadRequest(monitor.error());
+  }
+  response.values[MONITOR_KEY] = monitor.get();
+
+  // Add 'hosts'.
+  Try<string> hostsString = getFormValue(HOSTS_KEY, values);
+  if (hostsString.isError()) {
+    return BadRequest(hostsString.error());
+  }
+
+  vector<string> hosts = strings::split(hostsString.get(), ",");
+  JSON::Array hostArray;
+  hostArray.values.assign(hosts.begin(), hosts.end());
+
+  response.values[HOSTS_KEY] = hostArray;
+
+  // Add 'isHealthy'.
+  Try<string> level = getFormValue(LEVEL_KEY, values);
+  if (level.isError()) {
+    return BadRequest(level.error());
+  }
+
+  bool isHealthy = strings::upper(level.get()) == "OK";
+
+  // TODO(ccarson): This is a workaround b/c currently a bool is coerced
+  // into a JSON::Double instead of a JSON::True or JSON::False when
+  // you assign to a JSON::Value.
+  //
+  // SEE: https://issues.apache.org/jira/browse/MESOS-939
+  response.values["isHealthy"] =
+    (isHealthy ? JSON::Value(JSON::True()) : JSON::False());
+
+  return OK(response);
+}
+
 
 const string Master::Http::REDIRECT_HELP = HELP(
     TLDR(
@@ -296,21 +318,22 @@ const string Master::Http::REDIRECT_HELP = HELP(
         "this will attempt to redirect to the private IP address."));
 
 
-
 Future<Response> Master::Http::redirect(const Request& request)
 {
   LOG(INFO) << "HTTP request for '" << request.path << "'";
 
   // If there's no leader, redirect to this master's base url.
-  UPID pid = master.leader.isSome() ? master.leader.get() : master.self();
+  MasterInfo info = master.leader.isSome() ? master.leader.get() : master.info_;
 
-  Try<string> hostname = net::getHostname(pid.ip);
+  Try<string> hostname =
+    info.has_hostname() ? info.hostname() : net::getHostname(info.ip());
+
   if (hostname.isError()) {
     return InternalServerError(hostname.error());
   }
 
   return TemporaryRedirect(
-      "http://" + hostname.get() + ":" + stringify(pid.port));
+      "http://" + hostname.get() + ":" + stringify(info.port()));
 }
 
 
@@ -325,6 +348,9 @@ Future<Response> Master::Http::stats(const Request& request)
   object.values["active_schedulers"] = master.getActiveFrameworks().size();
   object.values["activated_slaves"] = master.slaves.size();
   object.values["deactivated_slaves"] = master.deactivatedSlaves.size();
+  object.values["outstanding_offers"] = master.offers.size();
+
+  // NOTE: These are monotonically increasing counters.
   object.values["staged_tasks"] = master.stats.tasks[TASK_STAGING];
   object.values["started_tasks"] = master.stats.tasks[TASK_STARTING];
   object.values["finished_tasks"] = master.stats.tasks[TASK_FINISHED];
@@ -333,7 +359,16 @@ Future<Response> Master::Http::stats(const Request& request)
   object.values["lost_tasks"] = master.stats.tasks[TASK_LOST];
   object.values["valid_status_updates"] = master.stats.validStatusUpdates;
   object.values["invalid_status_updates"] = master.stats.invalidStatusUpdates;
-  object.values["outstanding_offers"] = master.offers.size();
+
+  // Get a count of all active tasks in the cluster i.e., the tasks
+  // that are launched (TASK_STAGING, TASK_STARTING, TASK_RUNNING) but
+  // haven't reached terminal state yet.
+  // NOTE: This is a gauge representing an instantaneous value.
+  int active_tasks = 0;
+  foreachvalue (Framework* framework, master.frameworks) {
+    active_tasks += framework->tasks.size();
+  }
+  object.values["active_tasks_gauge"] = active_tasks;
 
   // Get total and used (note, not offered) resources in order to
   // compute capacity of scalar resources.
@@ -395,8 +430,9 @@ Future<Response> Master::Http::state(const Request& request)
   object.values["build_time"] = build::TIME;
   object.values["build_user"] = build::USER;
   object.values["start_time"] = master.startTime.secs();
-  object.values["id"] = master.info.id();
+  object.values["id"] = master.info().id();
   object.values["pid"] = string(master.self());
+  object.values["hostname"] = master.info().hostname();
   object.values["activated_slaves"] = master.slaves.size();
   object.values["deactivated_slaves"] = master.deactivatedSlaves.size();
   object.values["staged_tasks"] = master.stats.tasks[TASK_STAGING];
@@ -411,7 +447,7 @@ Future<Response> Master::Http::state(const Request& request)
   }
 
   if (master.leader.isSome()) {
-    object.values["leader"] = string(master.leader.get());
+    object.values["leader"] = master.leader.get().pid();
   }
 
   if (master.flags.log_dir.isSome()) {
@@ -505,11 +541,18 @@ struct TaskComparator
 {
   static bool ascending(const Task* lhs, const Task* rhs)
   {
-    if (lhs->statuses().size() == 0) {
+    size_t lhsSize = lhs->statuses().size();
+    size_t rhsSize = rhs->statuses().size();
+
+    if ((lhsSize == 0) && (rhsSize == 0)) {
+      return false;
+    }
+
+    if (lhsSize == 0) {
       return true;
     }
 
-    if (rhs->statuses().size() == 0) {
+    if (rhsSize == 0) {
       return false;
     }
 
@@ -518,7 +561,22 @@ struct TaskComparator
 
   static bool descending(const Task* lhs, const Task* rhs)
   {
-    return !ascending(lhs, rhs);
+    size_t lhsSize = lhs->statuses().size();
+    size_t rhsSize = rhs->statuses().size();
+
+    if ((lhsSize == 0) && (rhsSize == 0)) {
+      return false;
+    }
+
+    if (rhsSize == 0) {
+      return true;
+    }
+
+    if (lhsSize == 0) {
+      return false;
+    }
+
+    return (lhs->statuses(0).timestamp() > rhs->statuses(0).timestamp());
   }
 };
 

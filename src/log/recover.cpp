@@ -16,9 +16,11 @@
  * limitations under the License.
  */
 
+#include <stdint.h>
 #include <stdlib.h>
 
 #include <set>
+#include <vector>
 
 #include <process/defer.hpp>
 #include <process/delay.hpp>
@@ -41,6 +43,7 @@
 using namespace process;
 
 using std::set;
+using std::vector;
 
 namespace mesos {
 namespace internal {
@@ -101,7 +104,7 @@ protected:
     LOG(INFO) << "Start recovering a replica";
 
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
           static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
 
     // Check the current status of the local replica and decide if
@@ -117,6 +120,10 @@ protected:
     // Cancel all operations if they are still pending.
     discard(responses);
     catching.discard();
+
+    // TODO(benh): Discard our promise only after 'catching' has
+    // completed (ready, failed, or discarded).
+    promise.discard();
   }
 
 private:
@@ -336,9 +343,9 @@ private:
               << lowestBeginPosition.get() << " to "
               << highestEndPosition.get();
 
-    set<uint64_t> positions;
+    vector<uint64_t> positions;
     for (uint64_t p = begin; p <= end; ++p) {
-      positions.insert(p);
+      positions.push_back(p);
     }
 
     // Share the ownership of the replica. From this point until the

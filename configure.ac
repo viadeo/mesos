@@ -18,7 +18,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [0.17.0])
+AC_INIT([mesos], [0.19.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
@@ -94,7 +94,19 @@ AC_CONFIG_FILES([bin/gdb-mesos-local.sh], [chmod +x bin/gdb-mesos-local.sh])
 AC_CONFIG_FILES([bin/gdb-mesos-master.sh], [chmod +x bin/gdb-mesos-master.sh])
 AC_CONFIG_FILES([bin/gdb-mesos-slave.sh], [chmod +x bin/gdb-mesos-slave.sh])
 AC_CONFIG_FILES([bin/gdb-mesos-tests.sh], [chmod +x bin/gdb-mesos-tests.sh])
-
+AC_CONFIG_FILES([bin/lldb-mesos-local.sh], [chmod +x bin/lldb-mesos-local.sh])
+AC_CONFIG_FILES([bin/lldb-mesos-master.sh],
+		[chmod +x bin/lldb-mesos-master.sh])
+AC_CONFIG_FILES([bin/lldb-mesos-slave.sh], [chmod +x bin/lldb-mesos-slave.sh])
+AC_CONFIG_FILES([bin/lldb-mesos-tests.sh], [chmod +x bin/lldb-mesos-tests.sh])
+AC_CONFIG_FILES([bin/valgrind-mesos-local.sh],
+		[chmod +x bin/valgrind-mesos-local.sh])
+AC_CONFIG_FILES([bin/valgrind-mesos-slave.sh],
+		[chmod +x bin/valgrind-mesos-slave.sh])
+AC_CONFIG_FILES([bin/valgrind-mesos-master.sh],
+		[chmod +x bin/valgrind-mesos-master.sh])
+AC_CONFIG_FILES([bin/valgrind-mesos-tests.sh],
+		[chmod +x bin/valgrind-mesos-tests.sh])
 AC_CONFIG_FILES([src/deploy/mesos-daemon.sh])
 AC_CONFIG_FILES([src/deploy/mesos-start-cluster.sh])
 AC_CONFIG_FILES([src/deploy/mesos-start-masters.sh])
@@ -404,6 +416,8 @@ __EOF__
                   [chmod +x src/examples/java/test-framework])
   AC_CONFIG_FILES([src/examples/java/test-multiple-executors-framework],
                   [chmod +x src/examples/java/test-multiple-executors-framework])
+  AC_CONFIG_FILES([src/examples/java/test-log],
+                  [chmod +x src/examples/java/test-log])
   AC_CONFIG_FILES([src/java/mesos.pom])
 
   AC_DEFINE([MESOS_HAS_JAVA])
@@ -600,10 +614,14 @@ AM_CONDITIONAL([WITH_INCLUDED_ZOOKEEPER],
 if test "x$with_cxx11" = "xyes"; then
   AX_CXX_COMPILE_STDCXX_11([noext], [mandatory])
 
-   # If we're using clang, we need to pass -stdlib=libc++ too.
-  if test "x$CLANG" = "xyes"; then
-    CXXFLAGS="$CXXFLAGS -stdlib=libc++"
-  fi
+  case "$host_os" in
+  darwin* )
+    # If we're using clang, we need to pass -stdlib=libc++ too.
+    if test "x$CLANG" = "xyes"; then
+      CXXFLAGS="$CXXFLAGS -stdlib=libc++"
+    fi
+    ;;
+  esac
 
   # Force gtest to use it's own tuple implementation since 'tr1/tuple'
   # might not exist (for example, if building with clang).

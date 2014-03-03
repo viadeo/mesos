@@ -31,9 +31,11 @@ libprocess_la_SOURCES =		\
   src/decoder.hpp		\
   src/encoder.hpp		\
   src/gate.hpp			\
+  src/http.cpp			\
   src/latch.cpp			\
   src/pid.cpp			\
   src/process.cpp		\
+  src/reap.cpp			\
   src/statistics.cpp		\
   src/synchronized.hpp
 
@@ -87,13 +89,17 @@ libprocess_la_SOURCES +=					\
   $(top_srcdir)/include/process/process.hpp			\
   $(top_srcdir)/include/process/profiler.hpp			\
   $(top_srcdir)/include/process/protobuf.hpp			\
+  $(top_srcdir)/include/process/reap.hpp			\
   $(top_srcdir)/include/process/run.hpp				\
   $(top_srcdir)/include/process/shared.hpp			\
   $(top_srcdir)/include/process/socket.hpp			\
   $(top_srcdir)/include/process/statistics.hpp			\
+  $(top_srcdir)/include/process/system.hpp			\
+  $(top_srcdir)/include/process/subprocess.hpp			\
   $(top_srcdir)/include/process/time.hpp			\
   $(top_srcdir)/include/process/timeout.hpp			\
-  $(top_srcdir)/include/process/timer.hpp
+  $(top_srcdir)/include/process/timer.hpp			\
+  $(top_srcdir)/include/process/timeseries.hpp
 
 # Tests.
 check_PROGRAMS = tests
@@ -106,8 +112,10 @@ tests_SOURCES =							\
   src/tests/main.cpp						\
   src/tests/owned_tests.cpp					\
   src/tests/process_tests.cpp					\
+  src/tests/reap_tests.cpp					\
   src/tests/shared_tests.cpp					\
   src/tests/statistics_tests.cpp				\
+  src/tests/subprocess_tests.cpp				\
   src/tests/timeseries_tests.cpp				\
   src/tests/time_tests.cpp
 

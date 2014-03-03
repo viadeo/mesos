@@ -21,9 +21,6 @@
 #include <string>
 #include <vector>
 
-#include <mesos/mesos.hpp>
-#include <mesos/resources.hpp>
-
 #include <process/help.hpp>
 #include <process/owned.hpp>
 
@@ -36,14 +33,17 @@
 
 #include "common/attributes.hpp"
 #include "common/build.hpp"
+#include "common/http.hpp"
 #include "common/type_utils.hpp"
+
+#include "mesos/mesos.hpp"
+#include "mesos/resources.hpp"
 
 #include "slave/slave.hpp"
 
-namespace mesos {
-namespace internal {
-namespace slave {
 
+using process::Clock;
+using process::DESCRIPTION;
 using process::Future;
 using process::HELP;
 using process::Owned;
@@ -51,68 +51,27 @@ using process::TLDR;
 using process::USAGE;
 
 using process::http::OK;
-using process::http::Response;
-using process::http::Request;
 
 using std::map;
 using std::string;
 using std::vector;
 
+
+namespace mesos {
+namespace internal {
+namespace slave {
+
+
+// Pull in defnitions from common.
+using mesos::internal::model;
+
+// Pull in the process definitions.
+using process::http::Response;
+using process::http::Request;
+
+
 // TODO(bmahler): Kill these in favor of automatic Proto->JSON Conversion (when
 // in becomes available).
-
-// Returns a JSON object modeled on a Resources.
-JSON::Object model(const Resources& resources)
-{
-  JSON::Object object;
-
-  foreach (const Resource& resource, resources) {
-    switch (resource.type()) {
-      case Value::SCALAR:
-        object.values[resource.name()] = resource.scalar().value();
-        break;
-      case Value::RANGES:
-        object.values[resource.name()] = stringify(resource.ranges());
-        break;
-      case Value::SET:
-        object.values[resource.name()] = stringify(resource.set());
-        break;
-      default:
-        LOG(FATAL) << "Unexpected Value type: " << resource.type();
-        break;
-    }
-  }
-
-  return object;
-}
-
-
-JSON::Object model(const Attributes& attributes)
-{
-  JSON::Object object;
-
-  foreach (const Attribute& attribute, attributes) {
-    switch (attribute.type()) {
-      case Value::SCALAR:
-        object.values[attribute.name()] = attribute.scalar().value();
-        break;
-      case Value::RANGES:
-        object.values[attribute.name()] = stringify(attribute.ranges());
-        break;
-      case Value::SET:
-        object.values[attribute.name()] = stringify(attribute.set());
-        break;
-      case Value::TEXT:
-        object.values[attribute.name()] = attribute.text().value();
-        break;
-      default:
-        LOG(FATAL) << "Unexpected Value type: " << attribute.type();
-        break;
-    }
-  }
-
-  return object;
-}
 
 
 JSON::Object model(const CommandInfo& command)
@@ -161,20 +120,6 @@ JSON::Object model(const ExecutorInfo& executorInfo)
 }
 
 
-JSON::Object model(const Task& task)
-{
-  JSON::Object object;
-  object.values["id"] = task.task_id().value();
-  object.values["name"] = task.name();
-  object.values["executor_id"] = task.executor_id().value();
-  object.values["framework_id"] = task.framework_id().value();
-  object.values["slave_id"] = task.slave_id().value();
-  object.values["state"] = TaskState_Name(task.state());
-  object.values["resources"] = model(task.resources());
-  return object;
-}
-
-
 JSON::Object model(const TaskInfo& task)
 {
   JSON::Object object;
@@ -201,7 +146,7 @@ JSON::Object model(const Executor& executor)
   object.values["id"] = executor.id.value();
   object.values["name"] = executor.info.name();
   object.values["source"] = executor.info.source();
-  object.values["uuid"] = executor.uuid.toString();
+  object.values["container"] = executor.containerId.value();
   object.values["directory"] = executor.directory;
   object.values["resources"] = model(executor.resources);
 
@@ -285,6 +230,10 @@ Future<Response> Slave::Http::stats(const Request& request)
   JSON::Object object;
   object.values["uptime"] = (Clock::now() - slave.startTime).secs();
   object.values["total_frameworks"] = slave.frameworks.size();
+  object.values["registered"] = slave.master.isSome() ? "1" : "0";
+  object.values["recovery_errors"] = slave.recoveryErrors;
+
+  // NOTE: These are monotonically increasing counters.
   object.values["staged_tasks"] = slave.stats.tasks[TASK_STAGING];
   object.values["started_tasks"] = slave.stats.tasks[TASK_STARTING];
   object.values["finished_tasks"] = slave.stats.tasks[TASK_FINISHED];
@@ -293,8 +242,24 @@ Future<Response> Slave::Http::stats(const Request& request)
   object.values["lost_tasks"] = slave.stats.tasks[TASK_LOST];
   object.values["valid_status_updates"] = slave.stats.validStatusUpdates;
   object.values["invalid_status_updates"] = slave.stats.invalidStatusUpdates;
-  object.values["registered"] = slave.master.isSome() ? "1" : "0";
-  object.values["recovery_errors"] = slave.recoveryErrors;
+
+  // NOTE: These are gauges representing instantaneous values.
+
+  // Queued waiting for executor to register.
+  int queued_tasks = 0;
+
+  // Sent to executor (TASK_STAGING, TASK_STARTING, TASK_RUNNING).
+  int launched_tasks = 0;
+
+  foreachvalue (Framework* framework, slave.frameworks) {
+    foreachvalue (Executor* executor, framework->executors) {
+      queued_tasks += executor->queuedTasks.size();
+      launched_tasks += executor->launchedTasks.size();
+    }
+  }
+
+  object.values["queued_tasks_gauge"] = queued_tasks;
+  object.values["launched_tasks_gauge"] = launched_tasks;
 
   return OK(object, request.query.get("jsonp"));
 }

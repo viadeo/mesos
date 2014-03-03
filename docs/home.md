@@ -6,17 +6,16 @@ layout: documentation
 
 ## Users Documentation
 
-* [Mesos Configuration](configuration.md) command-line arguments
+* [Mesos Configuration](configuration.md) for command-line arguments
 * [Deploy Scripts](deploy-scripts.md) for launching a Mesos cluster on a set of machines.
 * [EC2 scripts](ec2-scripts.md) for launching a Mesos cluster on Amazon EC2.
-* [Logging and Debugging](logging-and-debugging.md) -- viewing Mesos and framework logs.
+* [Logging and Debugging](logging-and-debugging.md) for viewing Mesos and framework logs.
 * [High Availability](high-availability.md) for running multiple masters simultaneously.
-* [Slave Recovery](slave-recovery.md)
-* [Using Mesos Submit Tool](using-the-mesos-submit-tool.md) for launching a framework with a single task.
+* [Slave Recovery](slave-recovery.md) for doing seamless upgrades
 
 ## Running Mesos Frameworks
 
-* [Running Aurora on Mesos](https://github.com/apache/incubator-aurora/blob/master/docs/tutorial.md)
+* [Running Aurora on Mesos](https://github.com/apache/incubator-aurora/tree/master/docs)
 * [Running Chronos on Mesos](https://github.com/airbnb/chronos)
 * [Running Hadoop on Mesos](https://github.com/mesos/hadoop)
 * [Running Jenkins on Mesos](https://github.com/jenkinsci/mesos-plugin)
@@ -36,6 +35,7 @@ layout: documentation
 
 * [Mesos Developers Guide](mesos-developers-guide.md) includes resources for developers contributing to Mesos and the process of submitting patches for review.
 * [C++ Style Guide](mesos-c++-style-guide.md)
+* [Release Guide](release-guide.md)
 * [Mesos Development Road Map](mesos-roadmap.md)
 
 ## More Info about Mesos

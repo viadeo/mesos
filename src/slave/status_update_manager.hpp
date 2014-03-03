@@ -77,7 +77,7 @@ public:
 
   void initialize(
       const Flags& flags,
-      const PID<Slave>& slave);
+      const process::PID<Slave>& slave);
 
   // TODO(vinod): Come up with better names/signatures for the
   // checkpointing and non-checkpointing 'update()' functions.
@@ -92,7 +92,7 @@ public:
       const StatusUpdate& update,
       const SlaveID& slaveId,
       const ExecutorID& executorId,
-      const UUID& uuid);
+      const ContainerID& containerId);
 
   // Retries the update to the master (as long as the slave is
   // alive), but does not checkpoint the update.
@@ -118,7 +118,7 @@ public:
       const Option<state::SlaveState>& state);
 
   // TODO(vinod): Remove this hack once the new leader detector code is merged.
-  void newMasterDetected(const UPID& pid);
+  void newMasterDetected(const process::UPID& pid);
 
   // Resend all the pending updates right away.
   // This is useful when the updates were pending because there was
@@ -148,7 +148,7 @@ struct StatusUpdateStream
                      const Flags& _flags,
                      bool _checkpoint,
                      const Option<ExecutorID>& executorId,
-                     const Option<UUID>& uuid)
+                     const Option<ContainerID>& containerId)
     : checkpoint(_checkpoint),
       terminated(false),
       taskId(_taskId),
@@ -159,14 +159,14 @@ struct StatusUpdateStream
   {
     if (checkpoint) {
       CHECK_SOME(executorId);
-      CHECK_SOME(uuid);
+      CHECK_SOME(containerId);
 
       path = paths::getTaskUpdatesPath(
           paths::getMetaRootDir(flags.work_dir),
           slaveId,
           frameworkId,
           executorId.get(),
-          uuid.get(),
+          containerId.get(),
           taskId);
 
       // Create the base updates directory, if it doesn't exist.
@@ -321,7 +321,7 @@ struct StatusUpdateStream
   // TODO(vinod): Explore semantics to make these private.
   const bool checkpoint;
   bool terminated;
-  Option<Timeout> timeout; // Timeout for resending status update.
+  Option<process::Timeout> timeout; // Timeout for resending status update.
   std::queue<StatusUpdate> pending;
 
 private:

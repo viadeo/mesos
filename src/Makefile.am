@@ -27,6 +27,7 @@ include ../3rdparty/libprocess/3rdparty/versions.am
 DISTRIBUTE = 3rdparty/distribute-$(DISTRIBUTE_VERSION)
 LEVELDB = 3rdparty/leveldb
 ZOOKEEPER = 3rdparty/zookeeper-$(ZOOKEEPER_VERSION)/src/c
+ZOOKEEPER_JAR = 3rdparty/zookeeper-$(ZOOKEEPER_VERSION)/zookeeper-$(ZOOKEEPER_VERSION).jar
 LIBPROCESS = 3rdparty/libprocess
 STOUT = $(LIBPROCESS)/3rdparty/stout
 BOOST = $(LIBPROCESS)/3rdparty/boost-$(BOOST_VERSION)
@@ -82,6 +83,7 @@ MESOS_CPPFLAGS += -I../include
 MESOS_CPPFLAGS += -I../$(BOOST)
 MESOS_CPPFLAGS += -I../$(PROTOBUF)/src
 MESOS_CPPFLAGS += -I../$(GLOG)/src
+MESOS_CPPFLAGS += -I../$(LEVELDB)/include
 
 if WITH_INCLUDED_ZOOKEEPER
   MESOS_CPPFLAGS += -I../$(ZOOKEEPER)/include
@@ -170,19 +172,21 @@ libmesos_no_3rdparty_la_SOURCES =					\
 	master/registry.hpp						\
 	master/registry.proto                                           \
 	master/registrar.cpp						\
+	master/repairer.cpp						\
 	slave/constants.cpp						\
 	slave/gc.cpp							\
 	slave/monitor.cpp						\
 	slave/state.cpp							\
 	slave/slave.cpp							\
 	slave/http.cpp							\
-	slave/isolator.cpp						\
-	slave/process_isolator.cpp					\
-	slave/reaper.cpp						\
+	slave/containerizer/containerizer.cpp				\
+	slave/containerizer/isolator.cpp				\
+	slave/containerizer/launcher.cpp				\
+	slave/containerizer/mesos_containerizer.cpp			\
 	slave/status_update_manager.cpp					\
-	launcher/launcher.cpp						\
 	exec/exec.cpp							\
 	common/lock.cpp							\
+	common/http.cpp							\
 	common/date_utils.cpp						\
 	common/resources.cpp						\
 	common/attributes.cpp						\
@@ -205,11 +209,12 @@ pkginclude_HEADERS = $(top_srcdir)/include/mesos/executor.hpp	\
 nodist_pkginclude_HEADERS = ../include/mesos/mesos.hpp mesos.pb.h
 
 if OS_LINUX
-  libmesos_no_3rdparty_la_SOURCES += slave/cgroups_isolator.cpp
   libmesos_no_3rdparty_la_SOURCES += linux/cgroups.cpp
+  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/cpushare.cpp
+  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/mem.cpp
+  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/cgroups_launcher.cpp
   libmesos_no_3rdparty_la_SOURCES += linux/fs.cpp
 else
-  EXTRA_DIST += slave/cgroups_isolator.cpp
   EXTRA_DIST += linux/cgroups.cpp
   EXTRA_DIST += linux/fs.cpp
 endif
@@ -217,11 +222,12 @@ endif
 libmesos_no_3rdparty_la_SOURCES += common/attributes.hpp		\
 	common/build.hpp common/date_utils.hpp common/factory.hpp	\
 	common/protobuf_utils.hpp					\
+	common/http.hpp							\
 	common/lock.hpp							\
 	common/type_utils.hpp common/thread.hpp				\
 	examples/utils.hpp files/files.hpp				\
 	hdfs/hdfs.hpp							\
-	launcher/launcher.hpp linux/cgroups.hpp				\
+	linux/cgroups.hpp						\
 	linux/fs.hpp local/flags.hpp local/local.hpp			\
 	logging/flags.hpp logging/logging.hpp				\
 	master/allocator.hpp						\
@@ -233,18 +239,22 @@ libmesos_no_3rdparty_la_SOURCES += common/attributes.hpp		\
 	master/registrar.hpp						\
 	master/master.hpp master/sorter.hpp				\
 	messages/messages.hpp slave/constants.hpp			\
+	slave/containerizer/cgroups_launcher.hpp			\
+	slave/containerizer/containerizer.hpp				\
+	slave/containerizer/isolator.hpp				\
+	slave/containerizer/isolators/cgroups/cpushare.hpp		\
+	slave/containerizer/isolators/cgroups/mem.hpp			\
+	slave/containerizer/isolators/posix.hpp				\
+	slave/containerizer/launcher.hpp				\
+	slave/containerizer/mesos_containerizer.hpp			\
 	slave/flags.hpp slave/gc.hpp slave/monitor.hpp			\
-	slave/isolator.hpp						\
-	slave/cgroups_isolator.hpp					\
 	slave/paths.hpp slave/state.hpp					\
 	slave/status_update_manager.hpp					\
-	slave/process_isolator.hpp					\
-        slave/reaper.hpp						\
 	slave/slave.hpp							\
 	tests/environment.hpp tests/script.hpp				\
 	tests/zookeeper.hpp tests/flags.hpp tests/utils.hpp		\
 	tests/cluster.hpp						\
-	tests/isolator.hpp						\
+	tests/containerizer.hpp						\
 	tests/mesos.hpp							\
 	tests/zookeeper_test_server.hpp zookeeper/authentication.hpp	\
 	zookeeper/contender.hpp						\
@@ -305,8 +315,10 @@ liblog_la_SOURCES =							\
   log/log.cpp								\
   log/recover.cpp							\
   log/replica.cpp							\
+  log/tool/benchmark.cpp						\
   log/tool/initialize.cpp						\
-  log/tool/read.cpp
+  log/tool/read.cpp							\
+  log/tool/replica.cpp
 liblog_la_SOURCES +=							\
   log/catchup.hpp							\
   log/consensus.hpp							\
@@ -318,12 +330,14 @@ liblog_la_SOURCES +=							\
   log/replica.hpp							\
   log/storage.hpp							\
   log/tool.hpp								\
+  log/tool/benchmark.hpp						\
   log/tool/initialize.hpp						\
   log/tool/read.hpp							\
+  log/tool/replica.hpp							\
   messages/log.hpp							\
   messages/log.proto
 nodist_liblog_la_SOURCES = $(LOG_PROTOS)
-liblog_la_CPPFLAGS = -I../$(LEVELDB)/include $(MESOS_CPPFLAGS)
+liblog_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 
 libmesos_no_3rdparty_la_LIBADD += liblog.la
 
@@ -341,7 +355,7 @@ libstate_la_SOURCES +=							\
   messages/state.hpp							\
   messages/state.proto
 nodist_libstate_la_SOURCES = $(STATE_PROTOS)
-libstate_la_CPPFLAGS = -I../$(LEVELDB)/include $(MESOS_CPPFLAGS)
+libstate_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 
 libmesos_no_3rdparty_la_LIBADD += libstate.la
 
@@ -393,10 +407,10 @@ mesos_local_SOURCES = local/main.cpp
 mesos_local_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_local_LDADD = libmesos.la
 
-pkglibexec_PROGRAMS += mesos-launcher
-mesos_launcher_SOURCES = launcher/main.cpp
-mesos_launcher_CPPFLAGS = $(MESOS_CPPFLAGS)
-mesos_launcher_LDADD = libmesos.la
+pkglibexec_PROGRAMS += mesos-fetcher
+mesos_fetcher_SOURCES = launcher/fetcher.cpp
+mesos_fetcher_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_fetcher_LDADD = libmesos.la
 
 pkglibexec_PROGRAMS += mesos-executor
 mesos_executor_SOURCES = launcher/executor.cpp
@@ -550,7 +564,8 @@ EXAMPLES_SOURCE =							\
 	$(srcdir)/examples/java/TestExceptionFramework.java		\
 	$(srcdir)/examples/java/TestExecutor.java			\
 	$(srcdir)/examples/java/TestFramework.java			\
-	$(srcdir)/examples/java/TestMultipleExecutorsFramework.java
+	$(srcdir)/examples/java/TestMultipleExecutorsFramework.java	\
+	$(srcdir)/examples/java/TestLog.java
 EXTRA_DIST += $(EXAMPLES_SOURCE)
 
 
@@ -691,7 +706,7 @@ $(EXAMPLES_JAR): $(EXAMPLES_SOURCE)
 	@echo "Building examples.jar ..."
 	$(MKDIR_P) examples/java
 	$(JAVA_HOME)/bin/javac -source 1.6 -target 1.6			\
-          -cp $(PROTOBUF_JAR):$(MESOS_JAR):$(srcdir)/examples/java	\
+          -cp ../$(ZOOKEEPER_JAR):$(PROTOBUF_JAR):$(MESOS_JAR):$(srcdir)/examples/java	\
           -sourcepath $(srcdir)/examples/java -d examples/java	        \
           $(srcdir)/examples/java/*.java
 	$(JAVA_HOME)/bin/jar cf $@ -C examples/java .
@@ -840,6 +855,7 @@ mesos_tests_SOURCES =				\
   tests/allocator_tests.cpp			\
   tests/attributes_tests.cpp			\
   tests/authentication_tests.cpp		\
+  tests/containerizer.cpp			\
   tests/environment.cpp				\
   tests/examples_tests.cpp			\
   tests/exception_tests.cpp			\
@@ -857,8 +873,8 @@ mesos_tests_SOURCES =				\
   tests/monitor_tests.cpp			\
   tests/paths_tests.cpp				\
   tests/protobuf_io_tests.cpp			\
-  tests/reaper_tests.cpp			\
   tests/registrar_tests.cpp			\
+  tests/repair_tests.cpp			\
   tests/resource_offers_tests.cpp		\
   tests/resources_tests.cpp			\
   tests/sasl_tests.cpp				\
@@ -900,7 +916,8 @@ if HAS_JAVA
   EXAMPLESSCRIPTSJAVA = examples/java/test-framework			\
 			examples/java/test-executor			\
 			examples/java/test-exception-framework		\
-			examples/java/test-multiple-executors-framework
+			examples/java/test-multiple-executors-framework \
+			examples/java/test-log
 
   check_SCRIPTS += $(EXAMPLESCRIPTSJAVA)
   mesos_tests_DEPENDENCIES += $(EXAMPLESCRIPTSJAVA)
@@ -928,6 +945,7 @@ dist_check_SCRIPTS +=							\
   tests/no_executor_framework_test.sh					\
   tests/java_exception_test.sh						\
   tests/java_framework_test.sh						\
+  tests/java_log_test.sh						\
   tests/python_framework_test.sh
 
 # We use a check-local target for now to avoid the parallel test

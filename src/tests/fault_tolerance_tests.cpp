@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include <stdint.h>
 #include <unistd.h>
 
 #include <gmock/gmock.h>
@@ -41,10 +42,9 @@
 
 #include "master/master.hpp"
 
-#include "slave/isolator.hpp"
 #include "slave/slave.hpp"
 
-#include "tests/isolator.hpp"
+#include "tests/containerizer.hpp"
 #include "tests/mesos.hpp"
 
 using namespace mesos;
@@ -54,7 +54,6 @@ using namespace mesos::internal::tests;
 
 using mesos::internal::master::Master;
 
-using mesos::internal::slave::Isolator;
 using mesos::internal::slave::Slave;
 using mesos::internal::slave::STATUS_UPDATE_RETRY_INTERVAL_MIN;
 
@@ -483,9 +482,9 @@ TEST_F(FaultToleranceTest, PartitionedSlaveExitedExecutor)
   DROP_MESSAGES(Eq("PONG"), _, _);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestingIsolator isolator(&exec);
+  TestContainerizer containerizer(&exec);
 
-  Try<PID<Slave> > slave = StartSlave(&isolator);
+  Try<PID<Slave> > slave = StartSlave(&containerizer);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -582,10 +581,8 @@ TEST_F(FaultToleranceTest, PartitionedSlaveExitedExecutor)
   shutdownMessage = FUTURE_PROTOBUF(ShutdownMessage(), _, slave.get());
 
   // Induce an ExitedExecutorMessage from the slave.
-  dispatch(isolator,
-           &Isolator::killExecutor,
-           frameworkId.get(),
-           DEFAULT_EXECUTOR_INFO.executor_id());
+  containerizer.destroy(
+      frameworkId.get(), DEFAULT_EXECUTOR_INFO.executor_id());
 
   // Upon receiving the message, the master will shutdown the slave.
   AWAIT_READY(shutdownMessage);
@@ -1113,10 +1110,11 @@ TEST_F(FaultToleranceTest, ReregisterFrameworkExitedExecutor)
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestingIsolator isolator(&exec);
+  TestContainerizer containerizer(&exec);
+
   Owned<MasterDetector> slaveDetector(
       new StandaloneMasterDetector(master.get()));
-  Try<PID<Slave> > slave = StartSlave(&isolator, slaveDetector);
+  Try<PID<Slave> > slave = StartSlave(&containerizer, slaveDetector);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -1189,7 +1187,7 @@ TEST_F(FaultToleranceTest, ReregisterFrameworkExitedExecutor)
   DROP_PROTOBUFS(StatusUpdateMessage(), _, _);
 
   // Now kill the executor.
-  dispatch(isolator, &Isolator::killExecutor, frameworkId, DEFAULT_EXECUTOR_ID);
+  containerizer.destroy(frameworkId, DEFAULT_EXECUTOR_ID);
 
   AWAIT_READY(executorExitedMessage);
 
@@ -1426,6 +1424,9 @@ TEST_F(FaultToleranceTest, IgnoreKillTaskFromUnregisteredFramework)
   EXPECT_CALL(sched1, statusUpdate(&driver1, _))
     .WillOnce(FutureArg<1>(&status));
 
+  Future<StatusUpdateAcknowledgementMessage> statusUpdateAcknowledgementMessage
+    = FUTURE_PROTOBUF(StatusUpdateAcknowledgementMessage(), _, _);
+
   ExecutorDriver* execDriver;
   EXPECT_CALL(exec, registered(_, _, _, _))
     .WillOnce(SaveArg<0>(&execDriver));
@@ -1437,6 +1438,11 @@ TEST_F(FaultToleranceTest, IgnoreKillTaskFromUnregisteredFramework)
 
   AWAIT_READY(status);
   EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  // Wait for the status update acknowledgement to be sent. This
+  // ensures the slave doesn't resend the TASK_RUNNING update to the
+  // failed over scheduler (below).
+  AWAIT_READY(statusUpdateAcknowledgementMessage);
 
   // Now start the second failed over scheduler.
   MockScheduler sched2;
@@ -1675,12 +1681,12 @@ TEST_F(FaultToleranceTest, SlaveReregisterTerminatedExecutor)
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestingIsolator isolator(&exec);
+  TestContainerizer containerizer(&exec);
 
   StandaloneMasterDetector* detector =
     new StandaloneMasterDetector(master.get());
   Try<PID<Slave> > slave =
-    StartSlave(&isolator, Owned<MasterDetector>(detector));
+    StartSlave(&containerizer, Owned<MasterDetector>(detector));
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -1718,10 +1724,7 @@ TEST_F(FaultToleranceTest, SlaveReregisterTerminatedExecutor)
     FUTURE_PROTOBUF(ExitedExecutorMessage(), _, _);
 
   // Now kill the executor.
-  dispatch(isolator,
-           &Isolator::killExecutor,
-           frameworkId.get(),
-           DEFAULT_EXECUTOR_ID);
+  containerizer.destroy(frameworkId.get(), DEFAULT_EXECUTOR_ID);
 
   AWAIT_READY(executorExitedMessage);
 

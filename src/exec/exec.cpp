@@ -25,6 +25,7 @@
 #include <sstream>
 
 #include <mesos/executor.hpp>
+#include <mesos/mesos.hpp>
 
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
@@ -127,6 +128,8 @@ public:
       checkpoint(_checkpoint),
       recoveryTimeout(_recoveryTimeout)
   {
+    LOG(INFO) << "Version: " << MESOS_VERSION;
+
     install<ExecutorRegisteredMessage>(
         &ExecutorProcess::registered,
         &ExecutorRegisteredMessage::executor_info,
@@ -199,7 +202,7 @@ protected:
       return;
     }
 
-    VLOG(1) << "Executor registered on slave " << slaveId;
+    LOG(INFO) << "Executor registered on slave " << slaveId;
 
     connected = true;
     connection = UUID::random();
@@ -222,7 +225,7 @@ protected:
       return;
     }
 
-    VLOG(1) << "Executor re-registered on slave " << slaveId;
+    LOG(INFO) << "Executor re-registered on slave " << slaveId;
 
     connected = true;
     connection = UUID::random();
@@ -245,7 +248,7 @@ protected:
       return;
     }
 
-    VLOG(1) << "Received reconnect request from slave " << slaveId;
+    LOG(INFO) << "Received reconnect request from slave " << slaveId;
 
     // Update the slave link.
     slave = from;
@@ -372,7 +375,7 @@ protected:
       return;
     }
 
-    VLOG(1) << "Executor asked to shutdown";
+    LOG(INFO) << "Executor asked to shutdown";
 
     if (!local) {
       // Start the Shutdown Process.
@@ -406,7 +409,7 @@ protected:
 
   void abort()
   {
-    VLOG(1) << "De-activating the executor libprocess";
+    LOG(INFO) << "Deactivating the executor libprocess";
     CHECK(aborted);
 
     Lock lock(mutex);
@@ -424,8 +427,8 @@ protected:
     // not been any subsequent re-registrations with the slave in the
     // interim.
     if (connection == _connection) {
-      VLOG(1) << "Recovery timeout of " << recoveryTimeout << " exceeded; "
-              << "Shutting down";
+      LOG(INFO) << "Recovery timeout of " << recoveryTimeout << " exceeded; "
+                << "Shutting down";
       shutdown();
     }
   }
@@ -443,16 +446,16 @@ protected:
     if (checkpoint && connected) {
       connected = false;
 
-      VLOG(1) << "Slave exited, but framework has checkpointing enabled. "
-              << "Waiting " << recoveryTimeout << " to reconnect with slave "
-              << slaveId;
+      LOG(INFO) << "Slave exited, but framework has checkpointing enabled. "
+                << "Waiting " << recoveryTimeout << " to reconnect with slave "
+                << slaveId;
 
       delay(recoveryTimeout, self(), &Self::_recoveryTimeout, connection);
 
       return;
     }
 
-    VLOG(1) << "Slave exited ... shutting down";
+    LOG(INFO) << "Slave exited ... shutting down";
 
     connected = false;
 
@@ -486,8 +489,8 @@ protected:
   void sendStatusUpdate(const TaskStatus& status)
   {
     if (status.state() == TASK_STAGING) {
-      VLOG(1) << "Executor is not allowed to send "
-              << "TASK_STAGING status update. Aborting!";
+      LOG(ERROR) << "Executor is not allowed to send "
+                 << "TASK_STAGING status update. Aborting!";
 
       driver->abort();
 

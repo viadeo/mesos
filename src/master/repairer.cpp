@@ -16,38 +16,31 @@
  * limitations under the License.
  */
 
-#include "isolator.hpp"
-#include "process_isolator.hpp"
-#ifdef __linux__
-#include "cgroups_isolator.hpp"
-#endif
+#include "logging/logging.hpp"
 
+#include "master/repairer.hpp"
 
 namespace mesos {
 namespace internal {
-namespace slave {
+namespace master {
 
-Isolator* Isolator::create(const std::string &type)
+using std::string;
+
+void Repairer::observe(
+    const string& host,
+    const string& monitor,
+    bool isHealthy)
 {
-  if (type == "process") {
-    return new ProcessIsolator();
-#ifdef __linux__
-  } else if (type == "cgroups") {
-    return new CgroupsIsolator();
-#endif
-  }
-
-  return NULL;
+  LOG(INFO) << "Repairer::observed " << isHealthy << " for monitor '"
+    << monitor << "' on host '" << host << "'";
 }
 
 
-void Isolator::destroy(Isolator* isolator)
+Repairer::~Repairer()
 {
-  if (isolator != NULL) {
-    delete isolator;
-  }
 }
 
-} // namespace slave {
-} // namespace internal {
+
 } // namespace mesos {
+} // namespace internal {
+} // namespace master {

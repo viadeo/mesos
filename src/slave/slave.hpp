@@ -19,6 +19,8 @@
 #ifndef __SLAVE_HPP__
 #define __SLAVE_HPP__
 
+#include <stdint.h>
+
 #include <list>
 #include <string>
 #include <vector>
@@ -46,9 +48,9 @@
 #include "master/detector.hpp"
 
 #include "slave/constants.hpp"
+#include "slave/containerizer/containerizer.hpp"
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
-#include "slave/isolator.hpp"
 #include "slave/monitor.hpp"
 #include "slave/paths.hpp"
 #include "slave/state.hpp"
@@ -79,9 +81,8 @@ class Slave : public ProtobufProcess<Slave>
 {
 public:
   Slave(const Flags& flags,
-        bool local,
         MasterDetector* detector,
-        Isolator* isolator,
+        Containerizer* containerizer,
         Files* files);
 
   virtual ~Slave();
@@ -100,13 +101,13 @@ public:
       const TaskInfo& task);
 
   void _runTask(
-      const Future<bool>& future,
+      const process::Future<bool>& future,
       const FrameworkInfo& frameworkInfo,
       const FrameworkID& frameworkId,
       const std::string& pid,
       const TaskInfo& task);
 
-  Future<bool> unschedule(const std::string& path);
+  process::Future<bool> unschedule(const std::string& path);
 
   void killTask(
       const process::UPID& from,
@@ -147,22 +148,22 @@ public:
       const ExecutorID& executorId,
       const std::string& data);
 
-  void ping(const UPID& from, const std::string& body);
+  void ping(const process::UPID& from, const std::string& body);
 
   // Handles the status update.
   // NOTE: If 'pid' is a valid UPID an ACK is sent to this pid
   // after the update is successfully handled. If pid == UPID()
   // no ACK is sent. The latter is used by the slave to send
   // status updates it generated (e.g., TASK_LOST).
-  void statusUpdate(const StatusUpdate& update, const UPID& pid);
+  void statusUpdate(const StatusUpdate& update, const process::UPID& pid);
 
   // This is called when the status update manager finishes
   // handling the update. If the handling is successful, an
   // acknowledgment is sent to the executor.
   void _statusUpdate(
-      const Future<Nothing>& future,
+      const process::Future<Nothing>& future,
       const StatusUpdate& update,
-      const UPID& pid);
+      const process::UPID& pid);
 
   void statusUpdateAcknowledgement(
       const SlaveID& slaveId,
@@ -171,7 +172,7 @@ public:
       const std::string& uuid);
 
   void _statusUpdateAcknowledgement(
-      const Future<bool>& future,
+      const process::Future<bool>& future,
       const TaskID& taskId,
       const FrameworkID& frameworkId,
       const UUID& uuid);
@@ -179,14 +180,13 @@ public:
   void executorStarted(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      pid_t pid);
+      const ContainerID& containerId,
+      const process::Future<Nothing>& future);
 
   void executorTerminated(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      const Option<int>& status,
-      bool destroyed,
-      const std::string& message);
+      const process::Future<Containerizer::Termination>& termination);
 
   // NOTE: Pulled these to public to make it visible for testing.
   // TODO(vinod): Make tests friends to this class instead.
@@ -195,7 +195,7 @@ public:
   // TODO(vinod): Instead of making this function public, we need to
   // mock both GarbageCollector (and pass it through slave's constructor)
   // and os calls.
-  void _checkDiskUsage(const Future<Try<double> >& usage);
+  void _checkDiskUsage(const process::Future<Try<double> >& usage);
 
   // Shut down an executor. This is a two phase process. First, an
   // executor receives a shut down message (shut down phase), then
@@ -206,7 +206,7 @@ public:
 
   // Invoked whenever the detector detects a change in masters.
   // Made public for testing purposes.
-  void detected(const Future<Option<UPID> >& pid);
+  void detected(const process::Future<Option<MasterInfo> >& pid);
 
   enum State {
     RECOVERING,   // Slave is doing recovery.
@@ -221,9 +221,10 @@ public:
 // protected:
   virtual void initialize();
   virtual void finalize();
-  virtual void exited(const UPID& pid);
+  virtual void exited(const process::UPID& pid);
 
-  void fileAttached(const Future<Nothing>& result, const std::string& path);
+  void fileAttached(const process::Future<Nothing>& result,
+                    const std::string& path);
 
   Nothing detachFile(const std::string& path);
 
@@ -241,13 +242,13 @@ public:
   void shutdownExecutorTimeout(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      const UUID& uuid);
+      const ContainerID& containerId);
 
   // Shuts down the executor if it did not register yet.
   void registerExecutorTimeout(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      const UUID& uuid);
+      const ContainerID& containerId);
 
   // Cleans up all un-reregistered executors during recovery.
   void reregisterExecutorTimeout();
@@ -260,15 +261,21 @@ public:
   void checkDiskUsage();
 
   // Recovers the slave, status update manager and isolator.
-  Future<Nothing> recover(const Result<state::SlaveState>& state);
+  process::Future<Nothing> recover(const Result<state::SlaveState>& state);
 
-  // This is called after 'recoveR()'. If 'flags.reconnect' is
+  // This is called after 'recover()'. If 'flags.reconnect' is
   // 'reconnect', the slave attempts to reconnect to any old live
   // executors. Otherwise, the slave attempts to shutdown/kill them.
-  Future<Nothing> _recover();
+  process::Future<Nothing> _recover();
+
+  // This is a helper to call recover() on the containerizer at the end of
+  // recover() and before __recover().
+  // TODO(idownes): Remove this when we support defers to objects.
+  process::Future<Nothing> _recoverContainerizer(
+      const Option<state::SlaveState>& state);
 
   // This is called when recovery finishes.
-  void __recover(const Future<Nothing>& future);
+  void __recover(const process::Future<Nothing>& future);
 
   // Helper to recover a framework from the specified state.
   void recoverFramework(const state::FrameworkState& state);
@@ -316,22 +323,21 @@ private:
 
   const Flags flags;
 
-  bool local;
-
   SlaveInfo info;
 
-  Option<UPID> master;
+  Option<process::UPID> master;
 
   Resources resources;
   Attributes attributes;
 
   hashmap<FrameworkID, Framework*> frameworks;
 
-  boost::circular_buffer<Owned<Framework> > completedFrameworks;
+  boost::circular_buffer<process::Owned<Framework> > completedFrameworks;
 
   MasterDetector* detector;
 
-  Isolator* isolator;
+  Containerizer* containerizer;
+
   Files* files;
 
   // Statistics (initialized in Slave::initialize).
@@ -343,7 +349,7 @@ private:
     uint64_t invalidFrameworkMessages;
   } stats;
 
-  Time startTime;
+  process::Time startTime;
 
   GarbageCollector gc;
   ResourceMonitor monitor;
@@ -352,7 +358,7 @@ private:
 
   // Flag to indicate if recovery, including reconciling (i.e., reconnect/kill)
   // with executors is finished.
-  Promise<Nothing> recovered;
+  process::Promise<Nothing> recovered;
 
   // Root meta directory containing checkpointed data.
   const std::string metaDir;
@@ -369,7 +375,7 @@ struct Executor
       Slave* slave,
       const FrameworkID& frameworkId,
       const ExecutorInfo& info,
-      const UUID& uuid,
+      const ContainerID& containerId,
       const std::string& directory,
       bool checkpoint);
 
@@ -402,7 +408,7 @@ struct Executor
 
   const FrameworkID frameworkId;
 
-  const UUID uuid; // Distinguishes executor instances with same ExecutorID.
+  const ContainerID containerId;
 
   const std::string directory;
 
@@ -410,7 +416,7 @@ struct Executor
 
   const bool commandExecutor;
 
-  UPID pid;
+  process::UPID pid;
 
   Resources resources; // Currently consumed resources.
 
@@ -444,7 +450,7 @@ struct Framework
       Slave* slave,
       const FrameworkID& id,
       const FrameworkInfo& info,
-      const UPID& pid);
+      const process::UPID& pid);
 
   ~Framework();
 
@@ -477,7 +483,7 @@ struct Framework
   hashmap<ExecutorID, Executor*> executors;
 
   // Up to MAX_COMPLETED_EXECUTORS_PER_FRAMEWORK completed executors.
-  boost::circular_buffer<Owned<Executor> > completedExecutors;
+  boost::circular_buffer<process::Owned<Executor> > completedExecutors;
 private:
   Framework(const Framework&);              // No copying.
   Framework& operator = (const Framework&); // No assigning.

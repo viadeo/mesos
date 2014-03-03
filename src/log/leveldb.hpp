@@ -21,6 +21,10 @@
 
 #include <leveldb/db.h>
 
+#include <stdint.h>
+
+#include <stout/option.hpp>
+
 #include "log/storage.hpp"
 
 namespace mesos {
@@ -41,7 +45,9 @@ public:
 
 private:
   leveldb::DB* db;
-  uint64_t first; // First position still in leveldb, used during truncation.
+
+  // First position still in leveldb, used during truncation.
+  Option<uint64_t> first;
 };
 
 } // namespace log {

@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include <stdint.h>
 #include <stdlib.h>
 
 #include <set>
@@ -65,7 +66,7 @@ protected:
   virtual void initialize()
   {
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
         static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
 
     // Wait until there are enough (i.e., quorum of) replicas in the
@@ -81,6 +82,8 @@ protected:
     // quorum of replicas. In that case, we no longer care about
     // responses from other replicas, thus discarding them here.
     discard(responses);
+
+    promise.discard();
   }
 
 private:
@@ -242,7 +245,7 @@ protected:
   virtual void initialize()
   {
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
         static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
 
     // Wait until there are enough (i.e., quorum of) replicas in the
@@ -258,6 +261,8 @@ protected:
     // quorum of replicas. In that case, we no longer care about
     // responses from other replicas, thus discarding them here.
     discard(responses);
+
+    promise.discard();
   }
 
 private:
@@ -380,7 +385,7 @@ protected:
   virtual void initialize()
   {
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
         static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
 
     // Wait until there are enough (i.e., quorum of) replicas in the
@@ -396,6 +401,8 @@ protected:
     // quorum of replicas. In that case, we no longer care about
     // responses from other replicas, thus discarding them here.
     discard(responses);
+
+    promise.discard();
   }
 
 private:
@@ -524,7 +531,7 @@ protected:
   virtual void initialize()
   {
     // Stop when no one cares.
-    promise.future().onDiscarded(lambda::bind(
+    promise.future().onDiscard(lambda::bind(
         static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
 
     runPromisePhase();
@@ -532,8 +539,13 @@ protected:
 
   virtual void finalize()
   {
+    // Discard the futures we're waiting for.
     promising.discard();
     writing.discard();
+
+    // TODO(benh): Discard our promise only after 'promising' and
+    // 'writing' have completed (ready, failed, or discarded).
+    promise.discard();
   }
 
 private:

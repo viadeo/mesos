@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+#include <stdint.h>
+
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
 #include <process/id.hpp>
@@ -304,6 +306,8 @@ Future<Shared<Replica> > LogProcess::recover()
       .onAny(defer(self(), &Self::_recover));
   }
 
+  // TODO(benh): Add 'onDiscard' callback to our returned future.
+
   return promise->future();
 }
 
@@ -419,6 +423,9 @@ Future<Nothing> LogReaderProcess::recover()
   // set/failed when '_recover' is called.
   process::Promise<Nothing>* promise = new process::Promise<Nothing>();
   promises.push_back(promise);
+
+  // TODO(benh): Add 'onDiscard' callback to our returned future.
+
   return promise->future();
 }
 
@@ -579,6 +586,9 @@ Future<Nothing> LogWriterProcess::recover()
   // set/failed when '_recover' is called.
   process::Promise<Nothing>* promise = new process::Promise<Nothing>();
   promises.push_back(promise);
+
+  // TODO(benh): Add 'onDiscard' callback to our returned future.
+
   return promise->future();
 }
 

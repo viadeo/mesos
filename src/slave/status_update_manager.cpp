@@ -40,6 +40,11 @@
 using std::string;
 
 using process::wait; // Necessary on some OS's to disambiguate.
+using process::Failure;
+using process::Future;
+using process::PID;
+using process::Timeout;
+using process::UPID;
 
 namespace mesos {
 namespace internal {
@@ -71,7 +76,7 @@ public:
       const StatusUpdate& update,
       const SlaveID& slaveId,
       const ExecutorID& executorId,
-      const UUID& uuid);
+      const ContainerID& containerId);
 
   Future<Nothing> update(
       const StatusUpdate& update,
@@ -99,7 +104,7 @@ private:
       const SlaveID& slaveId,
       bool checkpoint,
       const Option<ExecutorID>& executorId,
-      const Option<UUID>& uuid);
+      const Option<ContainerID>& containerId);
 
   // Status update timeout.
   void timeout(const Duration& duration);
@@ -120,7 +125,7 @@ private:
       const SlaveID& slaveId,
       bool checkpoint,
       const Option<ExecutorID>& executorId,
-      const Option<UUID>& uuid);
+      const Option<ContainerID>& containerId);
 
   StatusUpdateStream* getStatusUpdateStream(
       const TaskID& taskId,
@@ -213,15 +218,16 @@ Future<Nothing> StatusUpdateManagerProcess::recover(
       }
 
       // We are only interested in the latest run of the executor!
-      const UUID& uuid = executor.latest.get();
-      CHECK(executor.runs.contains(uuid));
-      const RunState& run  = executor.runs.get(uuid).get();
+      const ContainerID& latest = executor.latest.get();
+      CHECK(executor.runs.contains(latest));
+      const RunState& run  = executor.runs.get(latest).get();
 
       if (run.completed) {
         VLOG(1) << "Skipping recovering updates of"
                 << " executor '" << executor.id
                 << "' of framework " << framework.id
-                << " because its latest run " << uuid << " is completed";
+                << " because its latest run " << latest.value()
+                << " is completed";
         continue;
       }
 
@@ -238,7 +244,7 @@ Future<Nothing> StatusUpdateManagerProcess::recover(
 
         // Create a new status update stream.
         StatusUpdateStream* stream = createStatusUpdateStream(
-            task.id, framework.id, state.get().id, true, executor.id, uuid);
+            task.id, framework.id, state.get().id, true, executor.id, latest);
 
         // Replay the stream.
         Try<Nothing> replay = stream->replay(task.updates, task.acks);
@@ -287,9 +293,9 @@ Future<Nothing> StatusUpdateManagerProcess::update(
     const StatusUpdate& update,
     const SlaveID& slaveId,
     const ExecutorID& executorId,
-    const UUID& uuid)
+    const ContainerID& containerId)
 {
-  return _update(update, slaveId, true, executorId, uuid);
+  return _update(update, slaveId, true, executorId, containerId);
 }
 
 
@@ -306,7 +312,7 @@ Future<Nothing> StatusUpdateManagerProcess::_update(
     const SlaveID& slaveId,
     bool checkpoint,
     const Option<ExecutorID>& executorId,
-    const Option<UUID>& uuid)
+    const Option<ContainerID>& containerId)
 {
   const TaskID& taskId = update.status().task_id();
   const FrameworkID& frameworkId = update.framework_id();
@@ -318,7 +324,7 @@ Future<Nothing> StatusUpdateManagerProcess::_update(
   StatusUpdateStream* stream = getStatusUpdateStream(taskId, frameworkId);
   if (stream == NULL) {
     stream = createStatusUpdateStream(
-        taskId, frameworkId, slaveId, checkpoint, executorId, uuid);
+        taskId, frameworkId, slaveId, checkpoint, executorId, containerId);
   }
 
   // Verify that we didn't get a non-checkpointable update for a
@@ -488,13 +494,13 @@ StatusUpdateStream* StatusUpdateManagerProcess::createStatusUpdateStream(
     const SlaveID& slaveId,
     bool checkpoint,
     const Option<ExecutorID>& executorId,
-    const Option<UUID>& uuid)
+    const Option<ContainerID>& containerId)
 {
   VLOG(1) << "Creating StatusUpdate stream for task " << taskId
           << " of framework " << frameworkId;
 
   StatusUpdateStream* stream = new StatusUpdateStream(
-      taskId, frameworkId, slaveId, flags, checkpoint, executorId, uuid);
+      taskId, frameworkId, slaveId, flags, checkpoint, executorId, containerId);
 
   streams[frameworkId][taskId] = stream;
   return stream;
@@ -569,7 +575,7 @@ Future<Nothing> StatusUpdateManager::update(
     const StatusUpdate& update,
     const SlaveID& slaveId,
     const ExecutorID& executorId,
-    const UUID& uuid)
+    const ContainerID& containerId)
 {
   return dispatch(
       process,
@@ -577,7 +583,7 @@ Future<Nothing> StatusUpdateManager::update(
       update,
       slaveId,
       executorId,
-      uuid);
+      containerId);
 }
 
 
