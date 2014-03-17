@@ -1,3 +1,9 @@
+mesos (0.16.0-9) unstable; urgency=low
+
+  * service log clean daily cron
+
+ -- Damien Hardy <dhardy@viadeoteam.com>  Mon, 17 Mar 2014 11:07:37 +0100
+
 mesos (0.16.0-8) unstable; urgency=low
 
   * release 0.16
