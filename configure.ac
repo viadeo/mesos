@@ -76,7 +76,7 @@ AC_CONFIG_COMMANDS_POST([ac_configure_args="$ac_configure_args_post"])
 
 AC_CONFIG_SUBDIRS([3rdparty/libprocess])
 
-AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([Makefile mesos.pc])
 AC_CONFIG_FILES([ec2/Makefile])
 AC_CONFIG_FILES([src/Makefile])
 AC_CONFIG_FILES([3rdparty/Makefile])
@@ -147,9 +147,9 @@ AC_ARG_WITH([included-zookeeper],
              [], [with_included_zookeeper=yes])
 
 AC_ARG_WITH([cxx11],
-            AS_HELP_STRING([--with-cxx11],
-                           [builds Mesos using C++11]),
-            [], [with_cxx11=no])
+            AS_HELP_STRING([--without-cxx11],
+                           [builds Mesos without C++11 support (deprecated)]),
+            [], [with_cxx11=yes])
 
 # TODO(benh): Support --without-included-protobuf,
 # --without-included-glog, etc. Doing this for protobuf is
@@ -200,6 +200,7 @@ AC_PROG_CC([gcc])
 # '-dumpversion' works for clang as well but as of clang 3.3 it
 # reports version 4.2.1 (for gcc backwards compatibility).
 GCC_VERSION="`${CC} -dumpversion`"
+AC_MSG_NOTICE([GCC version: $GCC_VERSION])
 test $? = 0 || AC_MSG_ERROR([failed to determine version of gcc])
 case  "${GCC_VERSION}" in
   4.4*)
@@ -523,10 +524,10 @@ __EOF__
   # settings are propagated to distutils.
   CXX="$CXX" CC="$CC" CXXFLAGS="$CXXFLAGS" CFLAGS="$CFLAGS" \
     LDFLAGS="$LDFLAGS" $PYTHON setup.py build_ext --inplace \
-    --build-temp ./ 2>1 >/dev/null
+    --build-temp ./ 2>&1 >/dev/null
 
   # Run a test-script that makes use of the Python egg.
-  pyeggtest=`$PYTHON -c "import minimal; print(minimal.test())" 2>1`
+  pyeggtest=`$PYTHON -c "import minimal; print(minimal.test())" 2>&1`
 
   # Validate the test-script output.
   AS_IF([test "x$pyeggtest" = "x42"], [pyeggbuild=yes])
@@ -580,11 +581,29 @@ There are two possible workarounds for this issue:
                   [chmod +x src/examples/python/test-framework])
   AC_CONFIG_FILES([src/python/setup.py])
 
+  # When clang is being used, make sure that the distutils python-
+  # config cflags extraction does not cause build errors (MESOS-1079).
+  # TODO(tillt): Remove this once Apple distributed an updated Python.
+  PYTHON_CFLAGS="$CFLAGS"
+  PYTHON_CPPFLAGS="$CPPFLAGS"
+
+  AS_IF([test "x$CLANG" = "xyes"],
+	[PYTHON_CFLAGS="$PYTHON_CFLAGS -Qunused-arguments"
+	 PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -Qunused-arguments"])
+
+  AC_SUBST([PYTHON_CFLAGS])
+  AC_SUBST([PYTHON_CPPFLAGS])
   AC_SUBST([PYTHON_EGG_POSTFIX])
   AC_SUBST([PYTHON_EGG_PUREPY_POSTFIX])
   AC_SUBST([PYTHON]) # Used by the example shell scripts and src/Makefile.am.
 
   AC_DEFINE([MESOS_HAS_PYTHON])
+
+  AC_PYTHON_MODULE([boto], [no],
+		   AC_MSG_WARN([can not find python-boto
+-------------------------------------------------------------------
+mesos-ec2 services will not function.
+-------------------------------------------------------------------]))
 
   has_python=yes
 fi
@@ -620,12 +639,13 @@ if test "x$with_cxx11" = "xyes"; then
     if test "x$CLANG" = "xyes"; then
       CXXFLAGS="$CXXFLAGS -stdlib=libc++"
     fi
+
+    # GTEST on OSX needs its own tr1 tuple.
+    # TODO(dhamon): Update to gmock 1.7 and pass GTEST_LANG_CXX11 when in
+    # c++11 mode.
+    CXXFLAGS="$CXXFLAGS -DGTEST_USE_OWN_TR1_TUPLE=1"
     ;;
   esac
-
-  # Force gtest to use it's own tuple implementation since 'tr1/tuple'
-  # might not exist (for example, if building with clang).
-  CXXFLAGS="-DGTEST_USE_OWN_TR1_TUPLE=1 $CXXFLAGS"
 
   # Also pass the flags to 3rdparty libraries.
   CONFIGURE_ARGS="$CONFIGURE_ARGS CXXFLAGS='$CXXFLAGS'"

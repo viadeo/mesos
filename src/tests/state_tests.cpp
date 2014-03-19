@@ -37,6 +37,7 @@
 
 #include "master/registry.hpp"
 
+#include "state/in_memory.hpp"
 #include "state/leveldb.hpp"
 #include "state/protobuf.hpp"
 #include "state/storage.hpp"
@@ -51,9 +52,6 @@ using namespace mesos::internal;
 
 using namespace process;
 
-using mesos::internal::registry::Slaves;
-using mesos::internal::registry::Slave;
-
 using state::LevelDBStorage;
 using state::Storage;
 #ifdef MESOS_HAS_JAVA
@@ -63,6 +61,8 @@ using state::ZooKeeperStorage;
 using state::protobuf::State;
 using state::protobuf::Variable;
 
+typedef mesos::internal::Registry::Slaves Slaves;
+typedef mesos::internal::Registry::Slave Slave;
 
 void FetchAndStoreAndFetch(State* state)
 {
@@ -301,6 +301,73 @@ void Names(State* state)
   AWAIT_READY(names);
   ASSERT_TRUE(names.get().size() == 1);
   EXPECT_EQ("slaves", names.get()[0]);
+}
+
+
+class InMemoryStateTest : public ::testing::Test
+{
+public:
+  InMemoryStateTest()
+    : storage(NULL),
+      state(NULL) {}
+
+protected:
+  virtual void SetUp()
+  {
+    storage = new state::InMemoryStorage();
+    state = new State(storage);
+  }
+
+  virtual void TearDown()
+  {
+    delete state;
+    delete storage;
+  }
+
+  state::Storage* storage;
+  State* state;
+};
+
+
+TEST_F(InMemoryStateTest, FetchAndStoreAndFetch)
+{
+  FetchAndStoreAndFetch(state);
+}
+
+
+TEST_F(InMemoryStateTest, FetchAndStoreAndStoreAndFetch)
+{
+  FetchAndStoreAndStoreAndFetch(state);
+}
+
+
+TEST_F(InMemoryStateTest, FetchAndStoreAndStoreFailAndFetch)
+{
+  FetchAndStoreAndStoreFailAndFetch(state);
+}
+
+
+TEST_F(InMemoryStateTest, FetchAndStoreAndExpungeAndFetch)
+{
+  FetchAndStoreAndExpungeAndFetch(state);
+}
+
+
+TEST_F(InMemoryStateTest, FetchAndStoreAndExpungeAndExpunge)
+{
+  FetchAndStoreAndExpungeAndExpunge(state);
+}
+
+
+TEST_F(InMemoryStateTest, FetchAndStoreAndExpungeAndStoreAndFetch)
+{
+  FetchAndStoreAndExpungeAndStoreAndFetch(state);
+}
+
+
+TEST_F(InMemoryStateTest, Names)
+{
+  Names(state);
 }
 
 

@@ -410,7 +410,7 @@ private:
   // URL for the master (e.g., zk://, file://, etc).
   std::string url;
 
-  // Mutex to enforce all non-callbacks are execute serially.
+  // Mutex to enforce all non-callbacks are executed serially.
   pthread_mutex_t mutex;
 
   // Condition variable for waiting until driver terminates.
@@ -420,6 +420,8 @@ private:
   Status status;
 
   const Credential* credential;
+
+  void initialize();
 
 protected:
   // Used to detect (i.e., choose) the master.

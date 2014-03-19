@@ -108,6 +108,7 @@ JSON::Object model(const Framework& framework)
   object.values["unregistered_time"] = framework.unregisteredTime.secs();
   object.values["active"] = framework.active;
   object.values["resources"] = model(framework.resources);
+  object.values["hostname"] = framework.info.hostname();
 
   // TODO(benh): Consider making reregisteredTime an Option.
   if (framework.registeredTime != framework.reregisteredTime) {
@@ -289,13 +290,7 @@ Future<Response> Master::Http::observe(const Request& request)
 
   bool isHealthy = strings::upper(level.get()) == "OK";
 
-  // TODO(ccarson): This is a workaround b/c currently a bool is coerced
-  // into a JSON::Double instead of a JSON::True or JSON::False when
-  // you assign to a JSON::Value.
-  //
-  // SEE: https://issues.apache.org/jira/browse/MESOS-939
-  response.values["isHealthy"] =
-    (isHealthy ? JSON::Value(JSON::True()) : JSON::False());
+  response.values["isHealthy"] = isHealthy;
 
   return OK(response);
 }
@@ -344,10 +339,10 @@ Future<Response> Master::Http::stats(const Request& request)
   JSON::Object object;
   object.values["uptime"] = (Clock::now() - master.startTime).secs();
   object.values["elected"] = master.elected(); // Note: using int not bool.
-  object.values["total_schedulers"] = master.frameworks.size();
+  object.values["total_schedulers"] = master.frameworks.activated.size();
   object.values["active_schedulers"] = master.getActiveFrameworks().size();
-  object.values["activated_slaves"] = master.slaves.size();
-  object.values["deactivated_slaves"] = master.deactivatedSlaves.size();
+  object.values["activated_slaves"] = master.slaves.activated.size();
+  object.values["deactivated_slaves"] = master.slaves.deactivated.size();
   object.values["outstanding_offers"] = master.offers.size();
 
   // NOTE: These are monotonically increasing counters.
@@ -365,7 +360,7 @@ Future<Response> Master::Http::stats(const Request& request)
   // haven't reached terminal state yet.
   // NOTE: This is a gauge representing an instantaneous value.
   int active_tasks = 0;
-  foreachvalue (Framework* framework, master.frameworks) {
+  foreachvalue (Framework* framework, master.frameworks.activated) {
     active_tasks += framework->tasks.size();
   }
   object.values["active_tasks_gauge"] = active_tasks;
@@ -374,7 +369,7 @@ Future<Response> Master::Http::stats(const Request& request)
   // compute capacity of scalar resources.
   Resources totalResources;
   Resources usedResources;
-  foreachvalue (Slave* slave, master.slaves) {
+  foreachvalue (Slave* slave, master.slaves.activated) {
     // Instead of accumulating all types of resources (which is
     // not necessary), we only accumulate scalar resources. This
     // helps us bypass a performance problem caused by range
@@ -433,8 +428,8 @@ Future<Response> Master::Http::state(const Request& request)
   object.values["id"] = master.info().id();
   object.values["pid"] = string(master.self());
   object.values["hostname"] = master.info().hostname();
-  object.values["activated_slaves"] = master.slaves.size();
-  object.values["deactivated_slaves"] = master.deactivatedSlaves.size();
+  object.values["activated_slaves"] = master.slaves.activated.size();
+  object.values["deactivated_slaves"] = master.slaves.deactivated.size();
   object.values["staged_tasks"] = master.stats.tasks[TASK_STAGING];
   object.values["started_tasks"] = master.stats.tasks[TASK_STARTING];
   object.values["finished_tasks"] = master.stats.tasks[TASK_FINISHED];
@@ -466,7 +461,7 @@ Future<Response> Master::Http::state(const Request& request)
   // Model all of the slaves.
   {
     JSON::Array array;
-    foreachvalue (Slave* slave, master.slaves) {
+    foreachvalue (Slave* slave, master.slaves.activated) {
       array.values.push_back(model(*slave));
     }
 
@@ -476,7 +471,7 @@ Future<Response> Master::Http::state(const Request& request)
   // Model all of the frameworks.
   {
     JSON::Array array;
-    foreachvalue (Framework* framework, master.frameworks) {
+    foreachvalue (Framework* framework, master.frameworks.activated) {
       array.values.push_back(model(*framework));
     }
 
@@ -488,7 +483,7 @@ Future<Response> Master::Http::state(const Request& request)
     JSON::Array array;
 
     foreach (const memory::shared_ptr<Framework>& framework,
-             master.completedFrameworks) {
+             master.frameworks.completed) {
       array.values.push_back(model(*framework));
     }
 
@@ -597,11 +592,11 @@ Future<Response> Master::Http::tasks(const Request& request)
 
   // Construct framework list with both active and completed framwworks.
   vector<const Framework*> frameworks;
-  foreachvalue (Framework* framework, master.frameworks) {
+  foreachvalue (Framework* framework, master.frameworks.activated) {
     frameworks.push_back(framework);
   }
   foreach (const memory::shared_ptr<Framework>& framework,
-           master.completedFrameworks) {
+           master.frameworks.completed) {
     frameworks.push_back(framework.get());
   }
 
