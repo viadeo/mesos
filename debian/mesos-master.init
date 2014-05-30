@@ -28,7 +28,6 @@ go_daemon() {
     ${CLUSTER:+--cluster=$CLUSTER} \
     ${SLAVES:+--slaves=$SLAVES} \
     ${WHITELIST:+--whitelist=$WHITELIST} \
-    ${LOGS:+--log_dir=$LOGS} \
     ${OPTS:+$OPS} \
     >> "$LOGS"/master.log 2>&1
 }
