@@ -1,0 +1,10 @@
+/var/log/mesos/master.log {
+	daily
+	missingok
+	rotate 7
+	compress
+	delaycompress
+	create 640 root adm
+        copytruncate
+}
+
