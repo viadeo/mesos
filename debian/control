@@ -14,8 +14,7 @@ Build-Depends:
  python-setuptools, 
  python-protobuf (>= 2.5.0), 
  chrpath, 
- libsasl2-dev,
- maven2
+ libsasl2-dev
 X-Python-Version: >= 2.6
 Standards-Version: 3.9.3
 Homepage: https://mesos.apache.org
