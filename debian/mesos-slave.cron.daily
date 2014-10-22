@@ -1,0 +1,10 @@
+#!/bin/sh
+
+# Purge logs from mesos-master
+# Default $LOG_RETENTION is 7 days
+
+[ ! -f /etc/default/mesos ]        || . /etc/default/mesos
+[ ! -f /etc/default/mesos-master ] || . /etc/default/mesos-master
+
+cd
+find ${LOGS:=/var/log/mesos} -name 'mesos-slave*' -mtime +${LOG_RETENTION:=7} -type f -delete
